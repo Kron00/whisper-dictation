@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Whisper Ding - plays periodic sound while recording
+# Lets you know recording is still active
+
+STATE_FILE="/tmp/whisper-dictate.state"
+DING_INTERVAL="${1:-15}"  # Default 15 seconds, can override
+
+# Subtle ding sound
+SOUND_DING="/usr/share/sounds/freedesktop/stereo/message.oga"
+
+# Wait a bit before first ding
+sleep "$DING_INTERVAL"
+
+while [[ -f "$STATE_FILE" ]] && [[ "$(cat "$STATE_FILE" 2>/dev/null)" == "recording" ]]; do
+    # Play a quieter ding (50% volume)
+    pw-play --volume=0.5 "$SOUND_DING" 2>/dev/null &
+    sleep "$DING_INTERVAL"
+done

@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Autonomous microphone gain control for whisper dictation."""
+import json
+import subprocess
+import sys
+import wave
+import struct
+import math
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "whisper-dictation"
+CONFIG_FILE = CONFIG_DIR / "autogain.json"
+RESTORE_FILE = Path("/tmp/whisper-autogain-restore")
+
+# Target levels (in dB)
+TARGET_PEAK_DB = -9.0      # Ideal peak level
+MIN_PEAK_DB = -20.0        # Too quiet threshold
+MAX_PEAK_DB = -3.0         # Too loud threshold
+ADJUSTMENT_STEP = 0.05     # 5% adjustment per learning cycle
+MIN_VOLUME = 0.30          # Never go below 30%
+MAX_VOLUME = 1.00          # Never exceed 100%
+DEFAULT_VOLUME = 0.70      # Starting point
+
+def get_current_volume():
+    """Get current mic volume via wpctl."""
+    result = subprocess.run(
+        ["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+        capture_output=True, text=True
+    )
+    # Output: "Volume: 0.80"
+    return float(result.stdout.split()[-1])
+
+def set_volume(level):
+    """Set mic volume via wpctl."""
+    level = max(MIN_VOLUME, min(MAX_VOLUME, level))
+    subprocess.run(
+        ["wpctl", "set-volume", "@DEFAULT_AUDIO_SOURCE@", str(level)],
+        capture_output=True
+    )
+
+def analyze_audio(wav_path):
+    """Analyze audio file for peak and RMS levels."""
+    with wave.open(wav_path, 'rb') as wf:
+        n_frames = wf.getnframes()
+        if n_frames == 0:
+            return None
+
+        frames = wf.readframes(n_frames)
+        samples = struct.unpack(f'{n_frames}h', frames)
+
+        # Calculate peak
+        peak = max(abs(s) for s in samples)
+        peak_ratio = peak / 32768.0
+        peak_db = 20 * math.log10(peak_ratio) if peak_ratio > 0 else -96
+
+        # Calculate RMS
+        rms = math.sqrt(sum(s**2 for s in samples) / n_frames)
+        rms_ratio = rms / 32768.0
+        rms_db = 20 * math.log10(rms_ratio) if rms_ratio > 0 else -96
+
+        # Detect clipping (samples at max value)
+        clipping = peak >= 32760
+
+        return {
+            "peak_db": peak_db,
+            "rms_db": rms_db,
+            "clipping": clipping
+        }
+
+def load_config():
+    """Load config, creating defaults if needed."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {"optimal_volume": DEFAULT_VOLUME}
+
+def save_config(config):
+    """Save config to file."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+def cmd_apply():
+    """Save current volume, then apply optimal for recording."""
+    # Save current volume so we can restore it later
+    current = get_current_volume()
+    RESTORE_FILE.write_text(str(current))
+
+    # Apply optimal recording volume
+    config = load_config()
+    optimal = config.get("optimal_volume", DEFAULT_VOLUME)
+    set_volume(optimal)
+
+def cmd_restore():
+    """Restore the original volume (for Discord, etc.)."""
+    if RESTORE_FILE.exists():
+        try:
+            original = float(RESTORE_FILE.read_text().strip())
+            set_volume(original)
+            RESTORE_FILE.unlink()  # Clean up
+        except (ValueError, OSError):
+            pass
+
+def cmd_learn(wav_path):
+    """Learn from a recording and adjust optimal volume."""
+    analysis = analyze_audio(wav_path)
+    if not analysis:
+        return
+
+    config = load_config()
+    current_optimal = config.get("optimal_volume", DEFAULT_VOLUME)
+
+    # Determine adjustment
+    if analysis["clipping"] or analysis["peak_db"] > MAX_PEAK_DB:
+        # Too loud - decrease
+        new_optimal = current_optimal - ADJUSTMENT_STEP
+    elif analysis["peak_db"] < MIN_PEAK_DB:
+        # Too quiet - increase
+        new_optimal = current_optimal + ADJUSTMENT_STEP
+    else:
+        # Good level - no change
+        new_optimal = current_optimal
+
+    # Clamp to valid range
+    new_optimal = max(MIN_VOLUME, min(MAX_VOLUME, new_optimal))
+
+    # Save
+    config["optimal_volume"] = new_optimal
+    config["last_analysis"] = analysis
+    save_config(config)
+
+def cmd_status():
+    """Show current status."""
+    config = load_config()
+    current = get_current_volume()
+    print(f"Current mic volume: {current:.0%}")
+    print(f"Saved optimal: {config.get('optimal_volume', DEFAULT_VOLUME):.0%}")
+    if "last_analysis" in config:
+        a = config["last_analysis"]
+        print(f"Last recording: peak={a['peak_db']:.1f}dB, clipping={a['clipping']}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        cmd_status()
+    elif sys.argv[1] == "apply":
+        cmd_apply()
+    elif sys.argv[1] == "restore":
+        cmd_restore()
+    elif sys.argv[1] == "learn" and len(sys.argv) > 2:
+        cmd_learn(sys.argv[2])
+    elif sys.argv[1] == "status":
+        cmd_status()
+    else:
+        print("Usage: whisper-autogain [apply|restore|learn <wav>|status]")

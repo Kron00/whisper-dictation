@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Whisper Noise Reduction control - toggle on/off
+
+NOISE_ENABLED_FILE="/tmp/whisper-noise-reduction.enabled"
+
+show_status() {
+    if [[ -f "$NOISE_ENABLED_FILE" ]]; then
+        echo "Noise reduction: enabled"
+    else
+        echo "Noise reduction: disabled"
+    fi
+}
+
+case "${1:-status}" in
+    on|enable)
+        touch "$NOISE_ENABLED_FILE"
+        echo "Noise reduction enabled"
+        ;;
+    off|disable)
+        rm -f "$NOISE_ENABLED_FILE"
+        echo "Noise reduction disabled"
+        ;;
+    toggle)
+        if [[ -f "$NOISE_ENABLED_FILE" ]]; then
+            rm -f "$NOISE_ENABLED_FILE"
+            echo "Noise reduction disabled"
+        else
+            touch "$NOISE_ENABLED_FILE"
+            echo "Noise reduction enabled"
+        fi
+        ;;
+    status|*)
+        show_status
+        ;;
+esac

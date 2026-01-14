@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Whisper Flow control - toggle on/off and switch modes
+
+FLOW_ENABLED_FILE="/tmp/whisper-flow.enabled"
+FLOW_MODE_FILE="/tmp/whisper-flow.mode"
+
+get_mode() {
+    if [[ -f "$FLOW_MODE_FILE" ]]; then
+        cat "$FLOW_MODE_FILE"
+    else
+        echo "regex"
+    fi
+}
+
+show_status() {
+    if [[ -f "$FLOW_ENABLED_FILE" ]]; then
+        echo "Flow: enabled ($(get_mode) mode)"
+    else
+        echo "Flow: disabled"
+    fi
+}
+
+case "${1:-status}" in
+    on|enable)
+        touch "$FLOW_ENABLED_FILE"
+        echo "Flow enabled ($(get_mode) mode)"
+        ;;
+    off|disable)
+        rm -f "$FLOW_ENABLED_FILE"
+        echo "Flow disabled - raw transcription only"
+        ;;
+    toggle)
+        if [[ -f "$FLOW_ENABLED_FILE" ]]; then
+            rm -f "$FLOW_ENABLED_FILE"
+            echo "Flow disabled"
+        else
+            touch "$FLOW_ENABLED_FILE"
+            echo "Flow enabled ($(get_mode) mode)"
+        fi
+        ;;
+    regex)
+        echo "regex" > "$FLOW_MODE_FILE"
+        touch "$FLOW_ENABLED_FILE"
+        echo "Flow: regex mode (instant, filler removal only)"
+        ;;
+    llm)
+        echo "llm" > "$FLOW_MODE_FILE"
+        touch "$FLOW_ENABLED_FILE"
+        echo "Flow: LLM mode (smarter, grammar + filler removal)"
+        ;;
+    warm)
+        # Pre-load LLM into VRAM
+        curl -s http://localhost:11434/api/generate -d '{"model": "mannix/llama3.1-8b-abliterated:q8_0", "prompt": "hi", "stream": false, "keep_alive": "30m", "options": {"num_predict": 1}}' > /dev/null
+        echo "LLM model warmed up in VRAM (30min keep-alive)"
+        ;;
+    status|*)
+        show_status
+        ;;
+esac

@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Virtual environment
+.local/share/whisper-dictation/
+
+# Model cache (huge files)
+.cache/huggingface/
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+models/
+
+# Runtime data
+*.db
+*.db-journal
+stats.db
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+*.wav
+*.pid
+*.sock
+*.state
+*.lock
+
+# User configuration
+.config/whisper-dictation/
+autogain.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

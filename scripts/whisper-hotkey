@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Listen for double middle mouse click and trigger whisper-dictate.
+Middle clicks are intercepted - use Ctrl+click for new tabs.
+
+Handles mouse disconnection gracefully - waits for reconnection.
+Resilient to device grab failures and enumeration errors."""
+import subprocess
+import evdev
+from evdev import ecodes, UInput
+import os
+import sys
+import logging
+import time
+
+# Setup logging - handle log file creation failures gracefully
+try:
+    logging.basicConfig(
+        filename='/tmp/whisper-hotkey.log',
+        level=logging.DEBUG,
+        format='%(asctime)s - %(message)s'
+    )
+except Exception:
+    # Fall back to stderr if log file can't be created
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(message)s'
+    )
+
+SCRIPT = os.path.expanduser("~/.local/bin/whisper-dictate")
+DOUBLE_CLICK_THRESHOLD = 0.3  # 300ms window for double-click
+RETRY_INTERVAL = 2  # Seconds between retries when mouse not found
+
+def find_mouse():
+    """Find a Logitech mouse with middle button capability.
+
+    Handles device enumeration errors gracefully - skips inaccessible devices.
+    """
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            if 'logitech' in dev.name.lower():
+                caps = dev.capabilities()
+                if ecodes.EV_KEY in caps:
+                    keys = caps[ecodes.EV_KEY]
+                    if ecodes.BTN_MIDDLE in keys:
+                        return dev
+        except (OSError, PermissionError, IOError) as e:
+            # Device disappeared or inaccessible during enumeration
+            logging.debug(f"Skipping inaccessible device {path}: {e}")
+            continue
+        except Exception as e:
+            logging.warning(f"Unexpected error accessing device {path}: {e}")
+            continue
+    return None
+
+def wait_for_mouse():
+    """Wait for mouse to be connected, retrying indefinitely."""
+    logging.info("Waiting for mouse to be connected...")
+    print("Waiting for mouse...", flush=True)
+    while True:
+        mouse = find_mouse()
+        if mouse:
+            logging.info(f"Found mouse: {mouse.name} ({mouse.path})")
+            print(f"Found mouse: {mouse.name} ({mouse.path})", flush=True)
+            return mouse
+        time.sleep(RETRY_INTERVAL)
+
+def run_listener(mouse):
+    """Run the event listener loop. Returns when mouse disconnects or on error.
+
+    Handles grab failures and UInput creation failures gracefully.
+    """
+    ui = None
+
+    # Try to grab device - may fail if already grabbed by another app
+    try:
+        mouse.grab()
+        logging.info("Grabbed mouse device exclusively")
+    except OSError as e:
+        logging.error(f"Failed to grab mouse device: {e}")
+        print(f"Failed to grab mouse (may be in use by another app): {e}", file=sys.stderr, flush=True)
+        time.sleep(RETRY_INTERVAL)
+        return  # Go back to wait_for_mouse loop
+    except Exception as e:
+        logging.error(f"Unexpected error grabbing mouse: {e}")
+        time.sleep(RETRY_INTERVAL)
+        return
+
+    # Try to create virtual device for passthrough
+    try:
+        ui = UInput.from_device(mouse, name="whisper-passthrough")
+        logging.info("Created virtual passthrough device")
+    except PermissionError as e:
+        logging.error(f"Permission denied creating UInput (check uinput permissions): {e}")
+        print(f"Permission denied for UInput - check /dev/uinput permissions", file=sys.stderr, flush=True)
+        try:
+            mouse.ungrab()
+        except:
+            pass
+        time.sleep(RETRY_INTERVAL)
+        return
+    except Exception as e:
+        logging.error(f"Failed to create UInput device: {e}")
+        print(f"Failed to create virtual input device: {e}", file=sys.stderr, flush=True)
+        try:
+            mouse.ungrab()
+        except:
+            pass
+        time.sleep(RETRY_INTERVAL)
+        return
+
+    last_click_time = 0
+    last_trigger_time = 0
+    COOLDOWN = 0.5  # 500ms cooldown after triggering
+
+    try:
+        for event in mouse.read_loop():
+            if event.type == ecodes.EV_KEY and event.code == ecodes.BTN_MIDDLE:
+                if event.value == 1:  # Press
+                    current_time = time.time()
+
+                    # Ignore clicks during cooldown
+                    if current_time - last_trigger_time < COOLDOWN:
+                        logging.debug("Ignoring click during cooldown")
+                        continue
+
+                    time_since_last = current_time - last_click_time
+
+                    if time_since_last < DOUBLE_CLICK_THRESHOLD:
+                        # Double-click detected - trigger script
+                        logging.info("Double middle-click detected - triggering script")
+                        try:
+                            subprocess.Popen([SCRIPT])
+                        except FileNotFoundError:
+                            logging.error(f"Script not found: {SCRIPT}")
+                        except PermissionError:
+                            logging.error(f"Permission denied executing: {SCRIPT}")
+                        except Exception as e:
+                            logging.error(f"Failed to launch script: {e}")
+                        last_click_time = 0  # Reset to prevent triple-click
+                        last_trigger_time = current_time  # Start cooldown
+                    else:
+                        # First click - just record time, don't pass through
+                        last_click_time = current_time
+                        logging.debug(f"First click at {current_time}")
+                # Don't pass through middle click at all (prevents paste)
+            else:
+                # Pass through all other events
+                try:
+                    ui.write_event(event)
+                    ui.syn()
+                except OSError:
+                    # Device disconnected during write
+                    logging.warning("Failed to write event - device may be disconnected")
+                    break
+
+    except OSError as e:
+        # Device disconnected
+        logging.warning(f"Mouse disconnected: {e}")
+        print("Mouse disconnected, waiting for reconnection...", flush=True)
+    except Exception as e:
+        logging.error(f"Unexpected error in event loop: {e}")
+        print(f"Error: {e}", file=sys.stderr, flush=True)
+    finally:
+        try:
+            mouse.ungrab()
+        except:
+            pass
+        try:
+            if ui:
+                ui.close()
+        except:
+            pass
+
+def main():
+    """Main loop - handles reconnection automatically."""
+    logging.info("Whisper hotkey listener starting")
+    print("Whisper hotkey listener starting", flush=True)
+
+    while True:
+        mouse = wait_for_mouse()
+        run_listener(mouse)
+        # If we get here, mouse was disconnected or error occurred - loop back and wait
+
+if __name__ == "__main__":
+    main()

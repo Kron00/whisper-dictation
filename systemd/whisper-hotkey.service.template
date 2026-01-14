@@ -1,0 +1,16 @@
+[Unit]
+Description=Whisper Dictation Hotkey Listener
+After=graphical.target whisper-daemon.service
+Wants=whisper-daemon.service
+
+[Service]
+ExecStart=$HOME/.local/share/whisper-dictation/bin/python3.12 $HOME/.local/bin/whisper-hotkey
+# Restart on any failure, with rate limiting
+Restart=always
+RestartSec=2
+# Stop restarting after 10 failures in 1 minute
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Install]
+WantedBy=default.target

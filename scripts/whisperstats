@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""WhisperStats - Statistics dashboard for Whisper Dictation"""
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib, Pango
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+import os
+
+STATS_DB = os.path.expanduser("~/.local/share/whisper-dictation/stats.db")
+
+# Average typing speed: 60 WPM, speaking: 150 WPM (fallback estimate)
+TYPING_WPM = 60
+SPEAKING_WPM = 150
+
+
+class StatsWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="WhisperStats")
+        self.set_default_size(500, 700)
+
+        # Main layout
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(main_box)
+
+        # Header bar
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="WhisperStats", subtitle="Dictation Statistics"))
+
+        # Refresh button
+        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh_btn.connect("clicked", lambda _: self.refresh_stats())
+        refresh_btn.set_tooltip_text("Refresh")
+        header.pack_end(refresh_btn)
+
+        main_box.append(header)
+
+        # Scrollable content
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        main_box.append(scroll)
+
+        # Content box with margin
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+        scroll.set_child(content)
+
+        # Stats cards
+        self.cards = {}
+
+        # Today's stats group
+        today_group = Adw.PreferencesGroup(title="Today")
+        content.append(today_group)
+
+        self.cards['words_today'] = self._create_stat_row("Words Dictated", "0", "accessories-text-editor-symbolic")
+        self.cards['dictations_today'] = self._create_stat_row("Dictations", "0", "audio-input-microphone-symbolic")
+        self.cards['time_saved_today'] = self._create_stat_row("Time Saved", "0 min", "alarm-symbolic")
+        today_group.add(self.cards['words_today'])
+        today_group.add(self.cards['dictations_today'])
+        today_group.add(self.cards['time_saved_today'])
+
+        # All time stats group
+        alltime_group = Adw.PreferencesGroup(title="All Time")
+        content.append(alltime_group)
+
+        self.cards['words_total'] = self._create_stat_row("Total Words", "0", "accessories-text-editor-symbolic")
+        self.cards['dictations_total'] = self._create_stat_row("Total Dictations", "0", "audio-input-microphone-symbolic")
+        self.cards['time_saved_total'] = self._create_stat_row("Total Time Saved", "0 min", "alarm-symbolic")
+        self.cards['avg_words'] = self._create_stat_row("Avg Words/Dictation", "0", "dialog-information-symbolic")
+        self.cards['speaking_wpm'] = self._create_stat_row("Your Speaking Rate", "0 WPM", "media-playback-start-symbolic")
+        alltime_group.add(self.cards['words_total'])
+        alltime_group.add(self.cards['dictations_total'])
+        alltime_group.add(self.cards['time_saved_total'])
+        alltime_group.add(self.cards['avg_words'])
+        alltime_group.add(self.cards['speaking_wpm'])
+
+        # This week stats
+        week_group = Adw.PreferencesGroup(title="This Week")
+        content.append(week_group)
+
+        self.cards['words_week'] = self._create_stat_row("Words This Week", "0", "x-office-document-symbolic")
+        self.cards['streak'] = self._create_stat_row("Active Days", "0 / 7", "emblem-ok-symbolic")
+        week_group.add(self.cards['words_week'])
+        week_group.add(self.cards['streak'])
+
+        # Languages group
+        lang_group = Adw.PreferencesGroup(title="Languages Detected")
+        content.append(lang_group)
+
+        self.lang_list = Gtk.ListBox()
+        self.lang_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.lang_list.add_css_class("boxed-list")
+        lang_group.add(self.lang_list)
+
+        # Recent dictations group
+        recent_group = Adw.PreferencesGroup(title="Recent Dictations")
+        content.append(recent_group)
+
+        self.recent_list = Gtk.ListBox()
+        self.recent_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.recent_list.add_css_class("boxed-list")
+        recent_group.add(self.recent_list)
+
+        # Load initial stats
+        self.refresh_stats()
+
+        # Auto-refresh every 30 seconds
+        GLib.timeout_add_seconds(30, self._auto_refresh)
+
+    def _create_stat_row(self, title, value, icon_name):
+        """Create an ActionRow for a statistic."""
+        row = Adw.ActionRow(title=title)
+        row.add_prefix(Gtk.Image(icon_name=icon_name))
+
+        label = Gtk.Label(label=value)
+        label.add_css_class("title-2")
+        row.add_suffix(label)
+        row._value_label = label
+
+        return row
+
+    def _auto_refresh(self):
+        """Auto-refresh callback."""
+        self.refresh_stats()
+        return True  # Continue timer
+
+    def refresh_stats(self):
+        """Refresh all statistics from database."""
+        if not Path(STATS_DB).exists():
+            return
+
+        try:
+            conn = sqlite3.connect(STATS_DB)
+            cursor = conn.cursor()
+
+            # Today's stats
+            today = datetime.now().date().isoformat()
+            cursor.execute(
+                "SELECT COUNT(*), SUM(word_count), SUM(audio_duration_ms) FROM dictations WHERE date(timestamp) = ?",
+                (today,)
+            )
+            row = cursor.fetchone()
+            dictations_today = row[0] or 0
+            words_today = row[1] or 0
+            audio_ms_today = row[2] or 0
+
+            self.cards['words_today']._value_label.set_text(f"{words_today:,}")
+            self.cards['dictations_today']._value_label.set_text(str(dictations_today))
+
+            # Time saved calculation (typing vs actual speaking time)
+            speak_time_today = audio_ms_today / 60000 if audio_ms_today > 0 else None
+            time_saved_today = self._calc_time_saved(words_today, speak_time_today)
+            self.cards['time_saved_today']._value_label.set_text(time_saved_today)
+
+            # All time stats
+            cursor.execute("SELECT COUNT(*), SUM(word_count), SUM(audio_duration_ms) FROM dictations")
+            row = cursor.fetchone()
+            dictations_total = row[0] or 0
+            words_total = row[1] or 0
+            audio_ms_total = row[2] or 0
+
+            self.cards['words_total']._value_label.set_text(f"{words_total:,}")
+            self.cards['dictations_total']._value_label.set_text(f"{dictations_total:,}")
+
+            # Time saved calculation (typing vs actual speaking time)
+            speak_time_total = audio_ms_total / 60000 if audio_ms_total > 0 else None
+            time_saved_total = self._calc_time_saved(words_total, speak_time_total)
+            self.cards['time_saved_total']._value_label.set_text(time_saved_total)
+
+            avg_words = words_total / dictations_total if dictations_total > 0 else 0
+            self.cards['avg_words']._value_label.set_text(f"{avg_words:.1f}")
+
+            # Calculate speaking WPM from audio duration
+            cursor.execute("SELECT SUM(word_count), SUM(audio_duration_ms) FROM dictations WHERE audio_duration_ms > 0")
+            row = cursor.fetchone()
+            total_words_with_duration = row[0] or 0
+            total_audio_ms = row[1] or 0
+            if total_audio_ms > 0:
+                speaking_wpm = (total_words_with_duration / (total_audio_ms / 60000))
+                self.cards['speaking_wpm']._value_label.set_text(f"{speaking_wpm:.0f} WPM")
+            else:
+                self.cards['speaking_wpm']._value_label.set_text("-- WPM")
+
+            # This week stats
+            week_ago = (datetime.now() - timedelta(days=7)).date().isoformat()
+            cursor.execute(
+                "SELECT SUM(word_count) FROM dictations WHERE date(timestamp) >= ?",
+                (week_ago,)
+            )
+            words_week = cursor.fetchone()[0] or 0
+            self.cards['words_week']._value_label.set_text(f"{words_week:,}")
+
+            # Active days this week
+            cursor.execute(
+                "SELECT COUNT(DISTINCT date(timestamp)) FROM dictations WHERE date(timestamp) >= ?",
+                (week_ago,)
+            )
+            active_days = cursor.fetchone()[0] or 0
+            self.cards['streak']._value_label.set_text(f"{active_days} / 7")
+
+            # Languages
+            cursor.execute(
+                "SELECT language, COUNT(*) as cnt FROM dictations GROUP BY language ORDER BY cnt DESC LIMIT 5"
+            )
+            languages = cursor.fetchall()
+
+            # Clear and rebuild language list
+            while True:
+                child = self.lang_list.get_first_child()
+                if child is None:
+                    break
+                self.lang_list.remove(child)
+
+            for lang, count in languages:
+                lang_name = self._get_language_name(lang)
+                row = Adw.ActionRow(title=lang_name, subtitle=f"{count} dictations")
+                row.add_prefix(Gtk.Image(icon_name="preferences-desktop-locale-symbolic"))
+                self.lang_list.append(row)
+
+            # Recent dictations
+            cursor.execute(
+                "SELECT timestamp, text, word_count FROM dictations ORDER BY timestamp DESC LIMIT 10"
+            )
+            recent = cursor.fetchall()
+
+            # Clear and rebuild recent list
+            while True:
+                child = self.recent_list.get_first_child()
+                if child is None:
+                    break
+                self.recent_list.remove(child)
+
+            for timestamp, text, word_count in recent:
+                # Parse and format timestamp
+                try:
+                    dt = datetime.fromisoformat(timestamp)
+                    time_str = dt.strftime("%H:%M")
+                    date_str = dt.strftime("%b %d")
+                except:
+                    time_str = ""
+                    date_str = ""
+
+                # Truncate long text
+                display_text = text[:80] + "..." if len(text) > 80 else text
+
+                row = Adw.ActionRow(
+                    title=display_text,
+                    subtitle=f"{date_str} {time_str} · {word_count} words"
+                )
+                self.recent_list.append(row)
+
+            conn.close()
+
+        except Exception as e:
+            print(f"Error loading stats: {e}")
+
+    def _calc_time_saved(self, words, actual_speak_time_min=None):
+        """Calculate time saved by speaking vs typing.
+
+        Args:
+            words: Number of words dictated
+            actual_speak_time_min: Actual speaking time in minutes (from audio duration)
+        """
+        if words == 0:
+            return "0 min"
+
+        # Time to type (minutes)
+        type_time = words / TYPING_WPM
+        # Time to speak (minutes) - use actual if available, otherwise estimate
+        if actual_speak_time_min and actual_speak_time_min > 0:
+            speak_time = actual_speak_time_min
+        else:
+            speak_time = words / SPEAKING_WPM
+        # Time saved
+        saved = type_time - speak_time
+
+        if saved < 1:
+            return f"{int(saved * 60)} sec"
+        elif saved < 60:
+            return f"{int(saved)} min"
+        else:
+            hours = int(saved // 60)
+            mins = int(saved % 60)
+            return f"{hours}h {mins}m"
+
+    def _get_language_name(self, code):
+        """Convert language code to name."""
+        names = {
+            "en": "English",
+            "es": "Spanish",
+            "fr": "French",
+            "de": "German",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "ru": "Russian",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "ar": "Arabic",
+            "hi": "Hindi",
+            "nl": "Dutch",
+            "pl": "Polish",
+            "tr": "Turkish",
+            "vi": "Vietnamese",
+            "th": "Thai",
+            "sv": "Swedish",
+            "da": "Danish",
+            "fi": "Finnish",
+            "no": "Norwegian",
+            "uk": "Ukrainian",
+            "cs": "Czech",
+            "el": "Greek",
+            "he": "Hebrew",
+            "id": "Indonesian",
+            "ms": "Malay",
+            "ro": "Romanian",
+            "hu": "Hungarian",
+        }
+        return names.get(code, code.upper() if code else "Unknown")
+
+
+class WhisperStatsApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="com.whisper.whisperstats")
+        self.connect("activate", self.on_activate)
+
+    def on_activate(self, app):
+        win = StatsWindow(app)
+        win.present()
+
+
+if __name__ == "__main__":
+    app = WhisperStatsApp()
+    app.run()

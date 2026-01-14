@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Parakeet TDT daemon - keeps model hot in VRAM for instant transcription
+Using NVIDIA Parakeet TDT 0.6B v2 - 50x faster than Whisper with better accuracy
+
+Resilient to GPU failures, model loading errors, and request failures."""
+import os
+import sys
+import socket
+import signal
+import json
+import re
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+SOCKET_PATH = "/tmp/whisper-daemon.sock"
+STATUS_PATH = "/tmp/whisper-daemon.status"
+STATS_DB = os.path.expanduser("~/.local/share/whisper-dictation/stats.db")
+VENV_PATH = os.path.expanduser("~/.local/share/whisper-dictation")
+NOISE_REDUCTION_FILE = "/tmp/whisper-noise-reduction.enabled"
+
+# Minimum VRAM required (3GB)
+MIN_VRAM_BYTES = 3 * 1024 * 1024 * 1024
+
+# Set up CUDA environment
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# Suppress NeMo/PyTorch warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Pre-compile filler word patterns for faster matching
+FILLER_PATTERNS = [
+    re.compile(r'\b(um+|uh+|er+|ah+|hmm+)\b', re.IGNORECASE),
+    re.compile(r'\b(you know)\b', re.IGNORECASE),
+    re.compile(r'\b(basically|actually|literally)\b', re.IGNORECASE),
+    re.compile(r'\b(i mean)\b', re.IGNORECASE),
+    re.compile(r'\bso,\s', re.IGNORECASE),
+    re.compile(r'\b(like,)\s', re.IGNORECASE),
+]
+CLEANUP_MULTI_SPACE = re.compile(r'\s+')
+CLEANUP_PUNCT_SPACE = re.compile(r'\s+([,.!?;:])')
+CLEANUP_LEADING_COMMA = re.compile(r'^\s*,\s*')
+
+# Spoken punctuation commands (order matters: longer phrases first)
+PUNCTUATION_COMMANDS = [
+    # Multi-word commands first
+    (re.compile(r'\b(exclamation point|exclamation mark)\b', re.IGNORECASE), '!'),
+    (re.compile(r'\bquestion mark\b', re.IGNORECASE), '?'),
+    (re.compile(r'\b(open parenthesis|open paren)\b', re.IGNORECASE), '('),
+    (re.compile(r'\b(close parenthesis|close paren)\b', re.IGNORECASE), ')'),
+    (re.compile(r'\b(open bracket)\b', re.IGNORECASE), '['),
+    (re.compile(r'\b(close bracket)\b', re.IGNORECASE), ']'),
+    (re.compile(r'\b(open quote|begin quote|left quote)\b', re.IGNORECASE), '"'),
+    (re.compile(r'\b(close quote|end quote|right quote)\b', re.IGNORECASE), '"'),
+    (re.compile(r'\bnew paragraph\b', re.IGNORECASE), '\n\n'),
+    (re.compile(r'\b(new line|newline)\b', re.IGNORECASE), '\n'),
+    # Single-word commands
+    (re.compile(r'\bperiod\b', re.IGNORECASE), '.'),
+    (re.compile(r'\bcomma\b', re.IGNORECASE), ','),
+    (re.compile(r'\bcolon\b', re.IGNORECASE), ':'),
+    (re.compile(r'\bsemicolon\b', re.IGNORECASE), ';'),
+    (re.compile(r'\b(hyphen|dash)\b', re.IGNORECASE), '-'),
+    (re.compile(r'\bellipsis\b', re.IGNORECASE), '...'),
+    (re.compile(r'\bapostrophe\b', re.IGNORECASE), "'"),
+    (re.compile(r'\bquote\b', re.IGNORECASE), '"'),
+    (re.compile(r'\b(ampersand|and sign)\b', re.IGNORECASE), '&'),
+    (re.compile(r'\basterisk\b', re.IGNORECASE), '*'),
+    (re.compile(r'\bat sign\b', re.IGNORECASE), '@'),
+    (re.compile(r'\b(percent|percent sign)\b', re.IGNORECASE), '%'),
+    (re.compile(r'\bdollar sign\b', re.IGNORECASE), '$'),
+    (re.compile(r'\b(hash|hashtag|pound sign)\b', re.IGNORECASE), '#'),
+    (re.compile(r'\bplus sign\b', re.IGNORECASE), '+'),
+    (re.compile(r'\bequals sign\b', re.IGNORECASE), '='),
+    (re.compile(r'\bunderscore\b', re.IGNORECASE), '_'),
+    (re.compile(r'\b(forward slash|slash)\b', re.IGNORECASE), '/'),
+    (re.compile(r'\bbackslash\b', re.IGNORECASE), r'\\'),
+]
+
+# Capitalization patterns
+CAPITALIZE_AFTER_PUNCT = re.compile(r'([.!?])\s+([a-z])')
+CAPITALIZE_AFTER_NEWLINE = re.compile(r'(\n)([a-z])')
+
+
+def write_status(status: str):
+    """Write daemon status to status file."""
+    try:
+        Path(STATUS_PATH).write_text(status)
+    except Exception as e:
+        print(f"Warning: Could not write status file: {e}", file=sys.stderr, flush=True)
+
+
+def check_gpu_available():
+    """Check if CUDA GPU is available and has enough memory.
+
+    Returns:
+        tuple: (available: bool, message: str)
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False, "CUDA not available - check NVIDIA drivers"
+
+        # Check device count
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            return False, "No CUDA devices found"
+
+        # Check VRAM
+        device_props = torch.cuda.get_device_properties(0)
+        total_mem = device_props.total_memory
+        # Note: memory_allocated() is 0 before we load anything, so just check total
+        if total_mem < MIN_VRAM_BYTES:
+            return False, f"Insufficient VRAM: {total_mem // (1024**2)}MB (need {MIN_VRAM_BYTES // (1024**2)}MB)"
+
+        return True, f"GPU OK: {device_props.name} ({total_mem // (1024**2)}MB)"
+
+    except ImportError:
+        return False, "PyTorch not installed or CUDA support missing"
+    except Exception as e:
+        return False, f"GPU check failed: {e}"
+
+
+def load_model():
+    """Load the Parakeet TDT model with error handling.
+
+    Returns:
+        tuple: (model or None, error_message or None)
+    """
+    try:
+        import nemo.collections.asr as nemo_asr
+
+        print("  Downloading/loading Parakeet TDT 0.6B v2...", flush=True)
+        model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
+        model.eval()
+        model.cuda()
+        return model, None
+
+    except ImportError as e:
+        return None, f"NeMo ASR not installed: {e}"
+    except RuntimeError as e:
+        # CUDA OOM or other runtime errors
+        error_str = str(e)
+        if "out of memory" in error_str.lower():
+            return None, "GPU out of memory - close other GPU applications"
+        elif "CUDA" in error_str:
+            return None, f"CUDA error: {error_str}"
+        return None, f"Runtime error: {error_str}"
+    except Exception as e:
+        return None, f"Model loading failed: {e}"
+
+
+def init_stats_db():
+    """Initialize SQLite database for statistics."""
+    try:
+        Path(STATS_DB).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(STATS_DB)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS dictations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                text TEXT NOT NULL,
+                word_count INTEGER NOT NULL,
+                char_count INTEGER NOT NULL,
+                duration_ms INTEGER,
+                audio_duration_ms INTEGER,
+                language TEXT,
+                mode TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON dictations(timestamp)
+        """)
+        try:
+            conn.execute("ALTER TABLE dictations ADD COLUMN audio_duration_ms INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Warning: Stats DB init failed: {e}", file=sys.stderr, flush=True)
+        return False
+
+
+def get_audio_duration_ms(audio_path: str) -> int:
+    """Get audio file duration in milliseconds."""
+    try:
+        import wave
+        with wave.open(audio_path, 'rb') as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            duration_sec = frames / float(rate)
+            return int(duration_sec * 1000)
+    except Exception:
+        return 0
+
+
+def log_dictation(text: str, duration_ms: int, audio_duration_ms: int, language: str, mode: str):
+    """Log a dictation to the statistics database."""
+    try:
+        word_count = len(text.split()) if text else 0
+        char_count = len(text) if text else 0
+        conn = sqlite3.connect(STATS_DB)
+        conn.execute(
+            "INSERT INTO dictations (timestamp, text, word_count, char_count, duration_ms, audio_duration_ms, language, mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), text, word_count, char_count, duration_ms, audio_duration_ms, language, mode)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Stats logging error: {e}", file=sys.stderr, flush=True)
+
+
+def is_noise_reduction_enabled() -> bool:
+    """Check if noise reduction is enabled via flag file."""
+    return os.path.exists(NOISE_REDUCTION_FILE)
+
+
+def preprocess_audio(audio_path: str) -> str:
+    """Apply noise reduction to audio file if enabled."""
+    if not is_noise_reduction_enabled():
+        return audio_path
+
+    try:
+        import noisereduce as nr
+        import numpy as np
+        import soundfile as sf
+
+        # Load audio
+        data, rate = sf.read(audio_path)
+
+        # Apply noise reduction (prop_decrease=0.8 removes 80% of detected noise)
+        reduced = nr.reduce_noise(y=data, sr=rate, prop_decrease=0.8)
+
+        # Save to temp file
+        clean_path = audio_path + ".clean.wav"
+        sf.write(clean_path, reduced, rate)
+
+        return clean_path
+    except ImportError:
+        print("Warning: noisereduce not installed, skipping noise reduction", file=sys.stderr, flush=True)
+        return audio_path
+    except Exception as e:
+        print(f"Noise reduction failed: {e}", file=sys.stderr, flush=True)
+        return audio_path  # Fall back to original
+
+
+def remove_fillers(text: str) -> str:
+    """Remove filler words and clean up spacing."""
+    try:
+        for pattern in FILLER_PATTERNS:
+            text = pattern.sub('', text)
+        text = CLEANUP_MULTI_SPACE.sub(' ', text)
+        text = CLEANUP_PUNCT_SPACE.sub(r'\1', text)
+        text = CLEANUP_LEADING_COMMA.sub('', text)
+        return text.strip()
+    except Exception as e:
+        print(f"Warning: Filler removal failed: {e}", file=sys.stderr, flush=True)
+        return text.strip()
+
+
+def process_punctuation(text: str) -> str:
+    """Convert spoken punctuation commands to actual punctuation symbols."""
+    try:
+        for pattern, symbol in PUNCTUATION_COMMANDS:
+            text = pattern.sub(symbol, text)
+
+        text = CLEANUP_MULTI_SPACE.sub(' ', text)
+        text = CLEANUP_PUNCT_SPACE.sub(r'\1', text)
+        text = re.sub(r'([\[({"])\s+', r'\1', text)
+        text = re.sub(r'\s+([\])}"])', r'\1', text)
+        text = CAPITALIZE_AFTER_PUNCT.sub(lambda m: m.group(1) + ' ' + m.group(2).upper(), text)
+        text = CAPITALIZE_AFTER_NEWLINE.sub(lambda m: m.group(1) + m.group(2).upper(), text)
+
+        if text and text[0].islower():
+            text = text[0].upper() + text[1:]
+
+        return text.strip()
+    except Exception as e:
+        print(f"Warning: Punctuation processing failed: {e}", file=sys.stderr, flush=True)
+        return text.strip()
+
+
+def warmup_model(model):
+    """Warm up the Parakeet model for fastest first transcription."""
+    try:
+        import numpy as np
+        import tempfile
+        import soundfile as sf
+
+        print("  Warming up CUDA kernels...", flush=True)
+
+        # Create a temporary audio file with silence for warmup
+        sample_rate = 16000
+        duration = 1.0  # 1 second
+        silence = np.zeros(int(sample_rate * duration), dtype=np.float32)
+
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            temp_path = f.name
+            sf.write(temp_path, silence, sample_rate)
+
+        try:
+            # Run 3 warmup passes
+            for i in range(3):
+                model.transcribe([temp_path])
+        finally:
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+
+        # Pre-warm text processing
+        _ = remove_fillers("um uh basically you know actually i mean so, like, test")
+        _ = process_punctuation("hello comma how are you question mark")
+
+        print("  Warmup complete!", flush=True)
+    except Exception as e:
+        print(f"Warning: Warmup failed (may affect first transcription speed): {e}", file=sys.stderr, flush=True)
+
+
+def handle_request(model, conn, data):
+    """Handle a single transcription request with full error handling."""
+    import time
+
+    try:
+        try:
+            msg = json.loads(data)
+            audio_path = msg.get("path", "")
+            mode = msg.get("mode", "normal")
+        except json.JSONDecodeError:
+            audio_path = data
+            mode = "normal"
+
+        if not audio_path:
+            print(f"Warning: Empty audio path received", file=sys.stderr, flush=True)
+            conn.sendall(b"")
+            return
+
+        if not os.path.exists(audio_path):
+            print(f"Warning: Audio file not found: {audio_path}", file=sys.stderr, flush=True)
+            conn.sendall(b"")
+            return
+
+        audio_duration_ms = get_audio_duration_ms(audio_path)
+        start_time = time.time()
+
+        # Apply noise reduction if enabled
+        clean_audio_path = preprocess_audio(audio_path)
+
+        # Transcribe with Parakeet - returns list of Hypothesis objects
+        # Parakeet includes punctuation and capitalization automatically
+        result = model.transcribe([clean_audio_path])
+        if result and len(result) > 0:
+            # Handle both string and Hypothesis object returns
+            hyp = result[0]
+            text = hyp.text if hasattr(hyp, 'text') else str(hyp)
+        else:
+            text = ""
+
+        # Clean up noise-reduced temp file if it was created
+        if clean_audio_path != audio_path and os.path.exists(clean_audio_path):
+            try:
+                os.remove(clean_audio_path)
+            except:
+                pass
+
+        # Post-process
+        text = process_punctuation(text)  # Convert spoken commands
+        text = remove_fillers(text)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        if text:
+            log_dictation(text, duration_ms, audio_duration_ms, "en", mode)
+
+        conn.sendall(text.encode())
+
+    except Exception as e:
+        print(f"Request handling error: {e}", file=sys.stderr, flush=True)
+        try:
+            conn.sendall(b"")
+        except:
+            pass
+
+
+def main():
+    import time
+
+    write_status("starting")
+
+    print("Initializing statistics database...", flush=True)
+    init_stats_db()
+
+    # Check GPU availability
+    print("Checking GPU availability...", flush=True)
+    gpu_ok, gpu_msg = check_gpu_available()
+    if not gpu_ok:
+        error_msg = f"error: {gpu_msg}"
+        write_status(error_msg)
+        print(f"GPU check failed: {gpu_msg}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    print(f"  {gpu_msg}", flush=True)
+
+    # Load model
+    print("Loading Parakeet TDT model into VRAM...", flush=True)
+    print("  (This may take a moment on first run to download the model)", flush=True)
+
+    model, error = load_model()
+    if error:
+        error_msg = f"error: {error}"
+        write_status(error_msg)
+        print(f"Model loading failed: {error}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    print("Model loaded, running warmup...", flush=True)
+    warmup_model(model)
+
+    # Clean up old socket
+    if os.path.exists(SOCKET_PATH):
+        try:
+            os.unlink(SOCKET_PATH)
+        except:
+            pass
+
+    # Create Unix socket server
+    try:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o600)
+        server.listen(5)
+    except Exception as e:
+        error_msg = f"error: Socket creation failed: {e}"
+        write_status(error_msg)
+        print(f"Failed to create socket: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    def cleanup(signum, frame):
+        print("\nShutting down...", flush=True)
+        write_status("stopped")
+        server.close()
+        if os.path.exists(SOCKET_PATH):
+            try:
+                os.unlink(SOCKET_PATH)
+            except:
+                pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    # Mark as ready
+    write_status("ready")
+    print(f"Ready! Listening on {SOCKET_PATH}", flush=True)
+
+    while True:
+        conn = None
+        try:
+            conn, _ = server.accept()
+            conn.settimeout(60)
+
+            data = conn.recv(4096).decode().strip()
+            handle_request(model, conn, data)
+
+        except socket.timeout:
+            print("Connection timed out", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr, flush=True)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+if __name__ == "__main__":
+    main()

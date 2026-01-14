@@ -1,0 +1,10 @@
+[Unit]
+Description=ydotool daemon
+After=graphical.target
+
+[Service]
+ExecStart=/usr/bin/ydotoold --socket-path=%t/ydotool.socket --socket-perm=0600
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

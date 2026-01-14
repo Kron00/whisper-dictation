@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Toggle or set whisper dictation mode
+# Modes: normal (standard), whisper (low-volume speech)
+
+MODE_FILE="/tmp/whisper-dictate.mode"
+
+# Safe notification function - falls back to echo if notify-send unavailable
+notify() {
+    if command -v notify-send &>/dev/null; then
+        notify-send "$@" 2>/dev/null || echo "$1: ${2:-}"
+    else
+        echo "$1: ${2:-}"
+    fi
+}
+
+current_mode() {
+    if [[ -f "$MODE_FILE" ]]; then
+        cat "$MODE_FILE" 2>/dev/null || echo "normal"
+    else
+        echo "normal"
+    fi
+}
+
+show_mode() {
+    local mode="$1"
+    case "$mode" in
+        normal)  notify -t 2000 "Whisper Mode" "Normal mode (standard volume)" ;;
+        whisper) notify -t 2000 "Whisper Mode" "Whisper mode (low volume)" ;;
+    esac
+}
+
+if [[ -n "${1:-}" ]]; then
+    # Set specific mode
+    case "$1" in
+        normal|whisper)
+            echo "$1" > "$MODE_FILE" 2>/dev/null || {
+                echo "Error: Could not write mode file" >&2
+                exit 1
+            }
+            show_mode "$1"
+            ;;
+        *)
+            echo "Usage: whisper-mode [normal|whisper]"
+            echo "Current mode: $(current_mode)"
+            exit 1
+            ;;
+    esac
+else
+    # Toggle between modes
+    current=$(current_mode)
+    case "$current" in
+        normal)  next="whisper" ;;
+        whisper) next="normal" ;;
+        *)       next="normal" ;;
+    esac
+    echo "$next" > "$MODE_FILE" 2>/dev/null || {
+        echo "Error: Could not write mode file" >&2
+        exit 1
+    }
+    show_mode "$next"
+fi

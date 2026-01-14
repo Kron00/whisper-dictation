@@ -1,0 +1,7 @@
+# Core dependencies
+nemo_toolkit[asr]>=1.23.0
+
+# Optional dependencies for noise reduction (uncomment if needed)
+# noisereduce>=3.0.0
+# soundfile>=0.12.1
+# numpy>=1.24.0

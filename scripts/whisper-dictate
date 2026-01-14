@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# Whisper Dictation - uses daemon for instant transcription with streaming preview
+# Resilient to daemon failures and resource issues
+set -euo pipefail
+
+STATE_FILE="/tmp/whisper-dictate.state"
+PID_FILE="/tmp/whisper-dictate.pid"
+STREAM_PID_FILE="/tmp/whisper-stream.pid"
+AUDIO_FILE="/tmp/whisper-dictate.wav"
+LOCK_FILE="/tmp/whisper-dictate.lock"
+MODE_FILE="/tmp/whisper-dictate.mode"
+SOCKET_PATH="/tmp/whisper-daemon.sock"
+STATUS_PATH="/tmp/whisper-daemon.status"
+PAUSED_PLAYERS_FILE="/tmp/whisper-paused-players"
+FLOW_ENABLED_FILE="/tmp/whisper-flow.enabled"
+FLOW_MODE_FILE="/tmp/whisper-flow.mode"  # "regex" (instant) or "llm" (smarter)
+AUTOGAIN_SCRIPT="$HOME/.local/bin/whisper-autogain"
+
+# Minimum /tmp space required (100MB in KB)
+MIN_TMP_SPACE_KB=102400
+
+# Ollama LLM settings (for LLM flow mode)
+OLLAMA_MODEL="mannix/llama3.1-8b-abliterated:q8_0"
+OLLAMA_URL="http://localhost:11434/api/generate"
+
+# Sounds - change these to customize
+SOUND_START="/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"
+
+# Other options:
+# bell.oga, camera-shutter.oga, audio-volume-change.oga, device-added.oga
+# dialog-information.oga, screen-capture.oga, service-login.oga
+
+export YDOTOOL_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ydotool.socket"
+
+# Safe notification function - falls back to echo if notify-send unavailable
+notify() {
+    if command -v notify-send &>/dev/null; then
+        notify-send "$@" 2>/dev/null || echo "$1: ${2:-}" >&2
+    else
+        echo "$1: ${2:-}" >&2
+    fi
+}
+
+play_sound() {
+    pw-play "$1" 2>/dev/null &
+}
+
+cleanup() {
+    rm -f "$PID_FILE" "$STREAM_PID_FILE" "$STATE_FILE" "$AUDIO_FILE" "$LOCK_FILE" "$PAUSED_PLAYERS_FILE" 2>/dev/null || true
+}
+
+# Ensure cleanup runs on unexpected exit
+trap 'rm -f "$LOCK_FILE" 2>/dev/null || true' EXIT
+
+# Check if /tmp has enough free space
+check_tmp_space() {
+    local free_kb
+    free_kb=$(df /tmp 2>/dev/null | tail -1 | awk '{print $4}') || free_kb=0
+    if (( free_kb < MIN_TMP_SPACE_KB )); then
+        notify "Whisper" "Low disk space in /tmp ($(( free_kb / 1024 ))MB free)" --urgency=critical
+        return 1
+    fi
+    return 0
+}
+
+# Check if daemon is healthy and ready
+check_daemon_health() {
+    # Check if status file exists
+    if [[ ! -f "$STATUS_PATH" ]]; then
+        notify "Whisper" "Daemon not running - restart whisper-daemon service" --urgency=critical
+        return 1
+    fi
+
+    # Check daemon status
+    local status
+    status=$(cat "$STATUS_PATH" 2>/dev/null) || status=""
+
+    case "$status" in
+        ready)
+            return 0
+            ;;
+        starting)
+            notify "Whisper" "Daemon is starting, please wait..." --urgency=normal
+            return 1
+            ;;
+        stopped)
+            notify "Whisper" "Daemon stopped - restart whisper-daemon service" --urgency=critical
+            return 1
+            ;;
+        error:*)
+            notify "Whisper" "Daemon error: ${status#error: }" --urgency=critical
+            return 1
+            ;;
+        *)
+            # Unknown status, try anyway
+            return 0
+            ;;
+    esac
+}
+
+get_mode() {
+    if [[ -f "$MODE_FILE" ]]; then
+        cat "$MODE_FILE" 2>/dev/null || echo "normal"
+    else
+        echo "normal"
+    fi
+}
+
+is_flow_enabled() {
+    [[ -f "$FLOW_ENABLED_FILE" ]]
+}
+
+get_flow_mode() {
+    if [[ -f "$FLOW_MODE_FILE" ]]; then
+        cat "$FLOW_MODE_FILE" 2>/dev/null || echo "regex"
+    else
+        echo "regex"  # Default to instant regex mode
+    fi
+}
+
+# Regex-based flow (instant, ~3ms)
+flow_rewrite_regex() {
+    local raw_text="$1"
+    local clean_text
+    clean_text=$(printf '%s' "$raw_text" | sed -E '
+        s/\b[Uu][mh]\b//g
+        s/\b[Uu]hh*\b//g
+        s/\b[Ee]rr*\b//g
+        s/\b[Aa]hh*\b//g
+        s/\b[Hh]mm+\b//g
+        s/\b[Ee]rm\b//g
+        s/  +/ /g
+        s/^ //
+        s/ $//')
+    # Remove repeated words (e.g., "so so so so" -> "so", "like, like, like" -> "like")
+    clean_text=$(printf '%s' "$clean_text" | sed -E ':a; s/\b([a-zA-Z]+)([ ,]+\1)+\b/\1/gi; ta')
+    clean_text="$(echo "${clean_text:0:1}" | tr '[:lower:]' '[:upper:]')${clean_text:1}"
+    if [[ ! "$clean_text" =~ [.!?]$ ]]; then
+        clean_text="${clean_text}."
+    fi
+    echo "$clean_text"
+}
+
+# LLM-based flow (smarter, ~320ms on 3090)
+flow_rewrite_llm() {
+    local raw_text="$1"
+    local system_prompt='Remove filler words (um, uh, er, ah, like, you know) from the input. Fix punctuation. Output ONLY the cleaned text. No preamble. No commentary. No quotes.'
+
+    local escaped_text escaped_system
+    escaped_text=$(printf '%s' "$raw_text" | jq -Rs '.')
+    escaped_system=$(printf '%s' "$system_prompt" | jq -Rs '.')
+
+    local response
+    response=$(curl -s --connect-timeout 1 --max-time 10 "$OLLAMA_URL" -d "{
+        \"model\": \"$OLLAMA_MODEL\",
+        \"prompt\": $escaped_text,
+        \"system\": $escaped_system,
+        \"stream\": false,
+        \"keep_alive\": \"30m\",
+        \"options\": {\"num_ctx\": 512, \"temperature\": 0, \"num_predict\": 200, \"num_gpu\": 99}
+    }" 2>/dev/null)
+
+    local clean_text
+    clean_text=$(printf '%s' "$response" | jq -r '.response // empty' 2>/dev/null)
+
+    if [[ -n "$clean_text" ]]; then
+        echo "$clean_text"
+    else
+        # Fallback to regex if LLM fails
+        flow_rewrite_regex "$raw_text"
+    fi
+}
+
+# Main flow rewrite dispatcher
+flow_rewrite() {
+    local raw_text="$1"
+
+    # Skip if empty or very short
+    if [[ -z "$raw_text" ]] || [[ ${#raw_text} -lt 3 ]]; then
+        echo "$raw_text"
+        return
+    fi
+
+    local mode
+    mode=$(get_flow_mode)
+
+    case "$mode" in
+        llm)
+            flow_rewrite_llm "$raw_text"
+            ;;
+        *)
+            flow_rewrite_regex "$raw_text"
+            ;;
+    esac
+}
+
+stop_streaming() {
+    if [[ -f "$STREAM_PID_FILE" ]]; then
+        kill "$(cat "$STREAM_PID_FILE")" 2>/dev/null || true
+        rm -f "$STREAM_PID_FILE"
+    fi
+}
+
+pause_audio() {
+    # Save currently playing players, then pause all
+    rm -f "$PAUSED_PLAYERS_FILE"
+    while IFS= read -r player; do
+        status=$(playerctl --player="$player" status 2>/dev/null) || continue
+        if [[ "$status" == "Playing" ]]; then
+            echo "$player" >> "$PAUSED_PLAYERS_FILE"
+        fi
+    done < <(playerctl --list-all 2>/dev/null || true)
+    playerctl --all-players pause 2>/dev/null || true
+}
+
+resume_audio() {
+    if [[ -f "$PAUSED_PLAYERS_FILE" ]]; then
+        while IFS= read -r player; do
+            playerctl --player="$player" play 2>/dev/null || true
+        done < "$PAUSED_PLAYERS_FILE"
+        rm -f "$PAUSED_PLAYERS_FILE"
+    fi
+}
+
+# Prevent multiple transcription processes
+if [[ -f "$LOCK_FILE" ]]; then
+    lock_pid=$(cat "$LOCK_FILE" 2>/dev/null) || lock_pid=""
+    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+        exit 0
+    fi
+    rm -f "$LOCK_FILE"
+fi
+
+start_recording() {
+    # Check resources before starting
+    if ! check_tmp_space; then
+        return 1
+    fi
+
+    if [[ -f "$PID_FILE" ]]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        rm -f "$PID_FILE"
+    fi
+    stop_streaming
+    rm -f "$AUDIO_FILE"
+
+    pause_audio
+    play_sound "$SOUND_START"
+
+    # Apply optimal microphone volume (invisible to user)
+    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" apply 2>/dev/null
+
+    pw-record --target=@DEFAULT_AUDIO_SOURCE@ --format=s16 --rate=16000 --channels=1 "$AUDIO_FILE" &
+    local record_pid=$!
+
+    # Verify pw-record started successfully
+    sleep 0.1
+    if ! kill -0 "$record_pid" 2>/dev/null; then
+        echo "Error: pw-record failed to start" >&2
+        resume_audio
+        return 1
+    fi
+
+    echo "$record_pid" > "$PID_FILE"
+    echo "recording" > "$STATE_FILE"
+
+    # Start streaming preview in background
+    ~/.local/bin/whisper-stream &
+    echo $! > "$STREAM_PID_FILE"
+}
+
+stop_and_transcribe() {
+    # Stop streaming first
+    stop_streaming
+
+    if [[ -f "$PID_FILE" ]]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        rm -f "$PID_FILE"
+    fi
+    rm -f "$STATE_FILE"
+
+    if [[ ! -f "$AUDIO_FILE" ]] || [[ ! -s "$AUDIO_FILE" ]]; then
+        cleanup
+        return 1
+    fi
+
+    echo $$ > "$LOCK_FILE"
+
+    # Check daemon health before transcribing
+    if ! check_daemon_health; then
+        rm -f "$AUDIO_FILE" "$LOCK_FILE"
+        resume_audio
+        return 1
+    fi
+
+    # Get current mode and build JSON request
+    mode=$(get_mode)
+    request="{\"path\": \"$AUDIO_FILE\", \"mode\": \"$mode\"}"
+
+    # Use daemon for instant transcription (model already in VRAM)
+    # Reduced timeout from 60s to 30s for better UX
+    if [[ -S "$SOCKET_PATH" ]]; then
+        text=$(echo "$request" | timeout 30 nc -U "$SOCKET_PATH" 2>/dev/null) || text=""
+    else
+        text=""
+    fi
+
+    # Restore original volume immediately (so Discord etc. work right away)
+    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" restore 2>/dev/null
+
+    # Learn from this recording in background (doesn't block paste)
+    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" learn "$AUDIO_FILE" &>/dev/null &
+
+    rm -f "$AUDIO_FILE" "$LOCK_FILE"
+
+    if [[ -n "$text" ]]; then
+        # Apply LLM Flow rewrite if enabled
+        if is_flow_enabled; then
+            text=$(flow_rewrite "$text")
+        fi
+
+        echo -n "$text" | wl-copy || true
+        ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 || true  # Ctrl+Shift+V
+    fi
+
+    resume_audio
+}
+
+if [[ -f "$STATE_FILE" ]] && [[ "$(cat "$STATE_FILE")" == "recording" ]]; then
+    stop_and_transcribe
+else
+    start_recording
+fi

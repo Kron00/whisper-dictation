@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Whisper Streaming - shows partial transcription while recording
+# Optimized with hardlinks and adaptive intervals
+
+AUDIO_FILE="/tmp/whisper-dictate.wav"
+STREAM_AUDIO="/tmp/whisper-stream.wav"
+MODE_FILE="/tmp/whisper-dictate.mode"
+SOCKET_PATH="/tmp/whisper-daemon.sock"
+
+# Adaptive interval settings
+INITIAL_INTERVAL=1.5   # Start with fast updates
+MAX_INTERVAL=3         # Slow down if no audio
+MIN_SIZE=32000         # 0.5 seconds at 16kHz s16
+
+INTERVAL=$INITIAL_INTERVAL
+LAST_SIZE=0
+CONSECUTIVE_SKIPS=0
+
+get_mode() {
+    if [[ -f "$MODE_FILE" ]]; then
+        cat "$MODE_FILE"
+    else
+        echo "normal"
+    fi
+}
+
+last_text=""
+
+# Wait for recording to actually start (audio file to exist)
+# Timeout after 5 seconds to avoid hanging indefinitely
+for i in {1..50}; do
+    if [[ -f "$AUDIO_FILE" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+while true; do
+    sleep "$INTERVAL"
+
+    # Check if still recording
+    if [[ ! -f "/tmp/whisper-dictate.state" ]]; then
+        break
+    fi
+
+    # Check if audio file exists and has content
+    if [[ ! -f "$AUDIO_FILE" ]] || [[ ! -s "$AUDIO_FILE" ]]; then
+        continue
+    fi
+
+    # Copy file to avoid race condition with pw-record writing
+    # Using cp ensures we get a complete snapshot, not a file being written to
+    cp "$AUDIO_FILE" "$STREAM_AUDIO" 2>/dev/null || continue
+
+    file_size=$(stat -c%s "$STREAM_AUDIO" 2>/dev/null || echo 0)
+
+    # Skip if file too small
+    if [[ "$file_size" -lt $MIN_SIZE ]]; then
+        ((CONSECUTIVE_SKIPS++)) || true
+        # Slow down if repeatedly skipping
+        if (( CONSECUTIVE_SKIPS > 3 )); then
+            INTERVAL=$MAX_INTERVAL
+        fi
+        continue
+    fi
+
+    # Reset to fast interval when we have audio
+    CONSECUTIVE_SKIPS=0
+    INTERVAL=$INITIAL_INTERVAL
+
+    # Transcribe
+    mode=$(get_mode)
+    request="{\"path\": \"$STREAM_AUDIO\", \"mode\": \"$mode\"}"
+
+    if [[ -S "$SOCKET_PATH" ]]; then
+        text=$(echo "$request" | timeout 15 nc -U "$SOCKET_PATH" 2>/dev/null) || text=""
+    else
+        text=""
+    fi
+
+    # Track last text to avoid redundant processing
+    if [[ -n "$text" ]] && [[ "$text" != "$last_text" ]]; then
+        last_text="$text"
+    fi
+
+    rm -f "$STREAM_AUDIO"
+done
+
+rm -f "$STREAM_AUDIO"

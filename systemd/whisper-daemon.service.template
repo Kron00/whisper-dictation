@@ -1,0 +1,17 @@
+[Unit]
+Description=Whisper Transcription Daemon (keeps model in VRAM)
+After=graphical.target
+
+[Service]
+Environment="LD_LIBRARY_PATH=$HOME/.local/share/whisper-dictation/lib/python3.12/site-packages/nvidia/cudnn/lib:$HOME/.local/share/whisper-dictation/lib/python3.12/site-packages/nvidia/cublas/lib"
+Environment="CUDA_VISIBLE_DEVICES=0"
+ExecStart=$HOME/.local/share/whisper-dictation/bin/python3.12 $HOME/.local/bin/whisper-daemon
+# Restart on any failure, with rate limiting to prevent boot loops
+Restart=always
+RestartSec=5
+# Stop restarting after 5 failures in 5 minutes
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target
