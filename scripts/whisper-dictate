@@ -63,6 +63,16 @@ check_tmp_space() {
     return 0
 }
 
+# Resume daemon if it was paused (e.g., by a power management tool)
+resume_daemon() {
+    local daemon_pid
+    daemon_pid=$(pgrep -f "whisper-daemon" | head -1) || return 0
+    if [[ -n "$daemon_pid" ]]; then
+        kill -CONT "$daemon_pid" 2>/dev/null || true
+        echo "ready" > "$STATUS_PATH" 2>/dev/null || true
+    fi
+}
+
 # Check if daemon is healthy and ready
 check_daemon_health() {
     # Check if status file exists
@@ -286,7 +296,8 @@ stop_and_transcribe() {
 
     echo $$ > "$LOCK_FILE"
 
-    # Check daemon health before transcribing
+    # Resume daemon if paused, then check health
+    resume_daemon
     if ! check_daemon_health; then
         rm -f "$AUDIO_FILE" "$LOCK_FILE"
         resume_audio
