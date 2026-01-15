@@ -7,6 +7,8 @@ import os
 import sys
 import socket
 import signal
+import threading
+import time
 import json
 import re
 import sqlite3
@@ -18,6 +20,9 @@ STATUS_PATH = "/tmp/whisper-daemon.status"
 STATS_DB = os.path.expanduser("~/.local/share/whisper-dictation/stats.db")
 VENV_PATH = os.path.expanduser("~/.local/share/whisper-dictation")
 NOISE_REDUCTION_FILE = "/tmp/whisper-noise-reduction.enabled"
+LAST_ACTIVE_FILE = "/tmp/whisper-daemon-last-active"
+IDLE_THRESHOLD = 900  # 15 minutes in seconds
+IDLE_CHECK_INTERVAL = 60  # Check every minute
 
 # Minimum VRAM required (3GB)
 MIN_VRAM_BYTES = 3 * 1024 * 1024 * 1024
@@ -90,6 +95,47 @@ def write_status(status: str):
         Path(STATUS_PATH).write_text(status)
     except Exception as e:
         print(f"Warning: Could not write status file: {e}", file=sys.stderr, flush=True)
+
+
+def is_on_battery():
+    """Check if system is running on battery power."""
+    try:
+        with open("/sys/class/power_supply/ADP0/online") as f:
+            return f.read().strip() == "0"
+    except:
+        return False  # Assume AC if can't detect
+
+
+def update_last_active():
+    """Update the last activity timestamp."""
+    try:
+        with open(LAST_ACTIVE_FILE, "w") as f:
+            f.write(str(int(time.time())))
+    except:
+        pass
+
+
+def idle_monitor():
+    """Background thread that pauses daemon when idle on battery."""
+    while True:
+        time.sleep(IDLE_CHECK_INTERVAL)
+        if is_on_battery():
+            try:
+                with open(LAST_ACTIVE_FILE) as f:
+                    last_active = int(f.read().strip())
+                idle_time = int(time.time()) - last_active
+                if idle_time > IDLE_THRESHOLD:
+                    print(f"Idle {idle_time}s on battery, pausing to save power...", flush=True)
+                    write_status("stopped")
+                    os.kill(os.getpid(), signal.SIGSTOP)
+                    # Execution resumes here after SIGCONT
+                    print("Resumed from power-save pause", flush=True)
+                    write_status("ready")
+                    update_last_active()
+            except FileNotFoundError:
+                update_last_active()  # Create file if missing
+            except:
+                pass
 
 
 def check_gpu_available():
@@ -378,6 +424,7 @@ def handle_request(model, conn, data):
             log_dictation(text, duration_ms, audio_duration_ms, "en", mode)
 
         conn.sendall(text.encode())
+        update_last_active()
 
     except Exception as e:
         print(f"Request handling error: {e}", file=sys.stderr, flush=True)
@@ -456,6 +503,11 @@ def main():
     # Mark as ready
     write_status("ready")
     print(f"Ready! Listening on {SOCKET_PATH}", flush=True)
+
+    # Start idle monitor for battery power saving
+    update_last_active()
+    idle_thread = threading.Thread(target=idle_monitor, daemon=True)
+    idle_thread.start()
 
     while True:
         conn = None
