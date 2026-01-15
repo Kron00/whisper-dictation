@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Wait for ydotoold socket to be ready
+SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ydotool.socket"
+MAX_WAIT=30
+WAITED=0
+
+while [[ ! -S "$SOCKET" ]] && (( WAITED < MAX_WAIT )); do
+    sleep 0.5
+    WAITED=$((WAITED + 1))
+done
+
+if [[ -S "$SOCKET" ]]; then
+    exit 0
+fi
+
+echo "ydotool socket not ready after ${MAX_WAIT}s" >&2
+exit 1

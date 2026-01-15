@@ -1,10 +1,16 @@
 [Unit]
 Description=ydotool daemon
-After=graphical.target
+After=dev-uinput.device
+Wants=dev-uinput.device
 
 [Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'test -w /dev/uinput || { echo "Waiting for /dev/uinput..."; sleep 2; test -w /dev/uinput; }'
 ExecStart=/usr/bin/ydotoold --socket-path=%t/ydotool.socket --socket-perm=0600
-Restart=on-failure
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Install]
 WantedBy=default.target

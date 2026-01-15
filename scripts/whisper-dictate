@@ -320,7 +320,10 @@ stop_and_transcribe() {
         fi
 
         echo -n "$text" | wl-copy || true
-        ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 || true  # Ctrl+Shift+V
+        # Paste with ydotool - notify user if it fails (text is still in clipboard)
+        if ! ydotool key 29:1 42:1 47:1 47:0 42:0 29:0; then  # Ctrl+Shift+V
+            notify "Whisper" "Paste failed! Text copied to clipboard - use Ctrl+V" --urgency=critical
+        fi
     fi
 
     resume_audio

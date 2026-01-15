@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Check health of all whisper-dictation components
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+check_service() {
+    local service="$1"
+    if systemctl --user is-active --quiet "$service"; then
+        echo -e "${GREEN}[OK]${NC} $service is running"
+        return 0
+    else
+        echo -e "${RED}[FAIL]${NC} $service is not running"
+        return 1
+    fi
+}
+
+check_socket() {
+    local socket="$1"
+    local name="$2"
+    if [[ -S "$socket" ]]; then
+        echo -e "${GREEN}[OK]${NC} $name socket exists"
+        return 0
+    else
+        echo -e "${RED}[FAIL]${NC} $name socket missing: $socket"
+        return 1
+    fi
+}
+
+check_permission() {
+    if [[ -w /dev/uinput ]]; then
+        echo -e "${GREEN}[OK]${NC} /dev/uinput is writable"
+        return 0
+    else
+        echo -e "${RED}[FAIL]${NC} /dev/uinput is not writable"
+        return 1
+    fi
+}
+
+echo "=== Whisper Dictation Health Check ==="
+echo
+
+ERRORS=0
+
+# Check permissions
+check_permission || ((ERRORS++))
+
+# Check services
+check_service ydotoold.service || ((ERRORS++))
+check_service whisper-daemon.service || ((ERRORS++))
+check_service whisper-hotkey.service || ((ERRORS++))
+
+# Check sockets
+YDOTOOL_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ydotool.socket"
+WHISPER_SOCKET="/tmp/whisper-daemon.sock"
+check_socket "$YDOTOOL_SOCKET" "ydotool" || ((ERRORS++))
+check_socket "$WHISPER_SOCKET" "whisper-daemon" || ((ERRORS++))
+
+# Check daemon status
+if [[ -f /tmp/whisper-daemon.status ]]; then
+    STATUS=$(cat /tmp/whisper-daemon.status)
+    if [[ "$STATUS" == "ready" ]]; then
+        echo -e "${GREEN}[OK]${NC} whisper-daemon status: ready"
+    else
+        echo -e "${RED}[FAIL]${NC} whisper-daemon status: $STATUS"
+        ((ERRORS++))
+    fi
+else
+    echo -e "${RED}[FAIL]${NC} whisper-daemon status file missing"
+    ((ERRORS++))
+fi
+
+echo
+if [[ $ERRORS -eq 0 ]]; then
+    echo -e "${GREEN}All checks passed!${NC}"
+else
+    echo -e "${RED}$ERRORS issue(s) found${NC}"
+    echo
+    echo "To restart all services:"
+    echo "  systemctl --user restart ydotoold whisper-daemon whisper-hotkey"
+fi
+
+exit $ERRORS
