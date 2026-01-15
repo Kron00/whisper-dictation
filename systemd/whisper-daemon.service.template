@@ -1,6 +1,7 @@
 [Unit]
 Description=Whisper Transcription Daemon (keeps model in VRAM)
-After=graphical.target
+After=graphical.target ydotoold.service
+Wants=ydotoold.service
 
 [Service]
 Environment="LD_LIBRARY_PATH=$HOME/.local/share/whisper-dictation/lib/python3.12/site-packages/nvidia/cudnn/lib:$HOME/.local/share/whisper-dictation/lib/python3.12/site-packages/nvidia/cublas/lib"

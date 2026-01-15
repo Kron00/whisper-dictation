@@ -1,10 +1,11 @@
 [Unit]
 Description=Whisper Dictation Hotkey Listener
-After=graphical.target whisper-daemon.service
-Wants=whisper-daemon.service
+After=graphical.target whisper-daemon.service ydotoold.service
+Wants=whisper-daemon.service ydotoold.service
 
 [Service]
-ExecStart=$HOME/.local/share/whisper-dictation/bin/python3.12 $HOME/.local/bin/whisper-hotkey
+ExecStartPre=$HOME/.local/bin/ydotool-wait
+ExecStart=/usr/bin/python3 $HOME/.local/bin/whisper-hotkey
 # Restart on any failure, with rate limiting
 Restart=always
 RestartSec=2
