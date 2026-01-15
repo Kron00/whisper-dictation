@@ -63,22 +63,42 @@ check_tmp_space() {
     return 0
 }
 
-# Resume daemon if it was paused (e.g., by a power management tool)
-resume_daemon() {
-    local daemon_pid
-    daemon_pid=$(pgrep -f "whisper-daemon" | head -1) || return 0
-    if [[ -n "$daemon_pid" ]]; then
-        kill -CONT "$daemon_pid" 2>/dev/null || true
-        echo "ready" > "$STATUS_PATH" 2>/dev/null || true
-    fi
+# Start daemon and wait for it to be ready
+start_daemon_and_wait() {
+    notify "Whisper" "Starting daemon (loading model)..." --urgency=low
+    systemctl --user start whisper-daemon.service 2>/dev/null || true
+
+    # Wait for daemon to be ready (model loading can take 30+ seconds)
+    local max_wait=90
+    local waited=0
+    while (( waited < max_wait )); do
+        sleep 1
+        ((waited++))
+        if [[ -f "$STATUS_PATH" ]]; then
+            local status
+            status=$(cat "$STATUS_PATH" 2>/dev/null) || status=""
+            case "$status" in
+                ready)
+                    return 0
+                    ;;
+                error:*)
+                    notify "Whisper" "Daemon error: ${status#error: }" --urgency=critical
+                    return 1
+                    ;;
+            esac
+        fi
+    done
+    notify "Whisper" "Daemon start timeout (${max_wait}s)" --urgency=critical
+    return 1
 }
 
-# Check if daemon is healthy and ready
+# Check if daemon is healthy and ready - auto-start if not running
 check_daemon_health() {
     # Check if status file exists
     if [[ ! -f "$STATUS_PATH" ]]; then
-        notify "Whisper" "Daemon not running - restart whisper-daemon service" --urgency=critical
-        return 1
+        # Daemon not running - start it
+        start_daemon_and_wait
+        return $?
     fi
 
     # Check daemon status
@@ -91,11 +111,26 @@ check_daemon_health() {
             ;;
         starting)
             notify "Whisper" "Daemon is starting, please wait..." --urgency=normal
+            # Wait for it to become ready
+            local max_wait=90
+            local waited=0
+            while (( waited < max_wait )); do
+                sleep 1
+                ((waited++))
+                status=$(cat "$STATUS_PATH" 2>/dev/null) || status=""
+                if [[ "$status" == "ready" ]]; then
+                    return 0
+                elif [[ "$status" == error:* ]]; then
+                    notify "Whisper" "Daemon error: ${status#error: }" --urgency=critical
+                    return 1
+                fi
+            done
             return 1
             ;;
-        stopped)
-            notify "Whisper" "Daemon stopped - restart whisper-daemon service" --urgency=critical
-            return 1
+        stopped|idle_exit)
+            # Daemon exited cleanly - restart it
+            start_daemon_and_wait
+            return $?
             ;;
         error:*)
             notify "Whisper" "Daemon error: ${status#error: }" --urgency=critical
@@ -296,8 +331,7 @@ stop_and_transcribe() {
 
     echo $$ > "$LOCK_FILE"
 
-    # Resume daemon if paused, then check health
-    resume_daemon
+    # Check daemon health (auto-starts if not running)
     if ! check_daemon_health; then
         rm -f "$AUDIO_FILE" "$LOCK_FILE"
         resume_audio
