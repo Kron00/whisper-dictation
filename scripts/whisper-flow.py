@@ -141,7 +141,9 @@ print(text)
 
                 # Copy to clipboard and paste
                 subprocess.run(['wl-copy', text], check=True)
-                subprocess.run(['ydotool', 'key', '29:1', '42:1', '47:1', '47:0', '42:0', '29:0'])
+                ydotool_env = os.environ.copy()
+                ydotool_env['YDOTOOL_SOCKET'] = f"/run/user/{os.getuid()}/ydotool.socket"
+                subprocess.run(['ydotool', 'key', '29:1', '42:1', '47:1', '47:0', '42:0', '29:0'], env=ydotool_env)
 
 
             # Clean up
