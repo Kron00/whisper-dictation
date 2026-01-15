@@ -366,7 +366,6 @@ stop_and_transcribe() {
 
         echo -n "$text" | wl-copy || true
         ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 || true  # Ctrl+Shift+V
-        date +%s > /tmp/whisper-daemon-last-active 2>/dev/null || true
     fi
 
     resume_audio
