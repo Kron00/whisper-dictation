@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
-"""Parakeet TDT daemon - keeps model hot in VRAM for instant transcription
-Using NVIDIA Parakeet TDT 0.6B v2 - 50x faster than Whisper with better accuracy
+#!/home/julian/.local/share/whisper-dictation/bin/python3
+"""Whisper daemon - keeps model hot in VRAM for instant transcription
+Using faster-whisper with distil-large-v3 + Silero VAD for low hallucination
 
 Resilient to GPU failures, model loading errors, and request failures."""
 import os
@@ -16,16 +16,27 @@ from pathlib import Path
 SOCKET_PATH = "/tmp/whisper-daemon.sock"
 STATUS_PATH = "/tmp/whisper-daemon.status"
 STATS_DB = os.path.expanduser("~/.local/share/whisper-dictation/stats.db")
-VENV_PATH = os.path.expanduser("~/.local/share/whisper-dictation")
 NOISE_REDUCTION_FILE = "/tmp/whisper-noise-reduction.enabled"
+DICTIONARY_PATH = os.path.expanduser("~/.config/whisper-dictation/dictionary.json")
 
-# Minimum VRAM required (3GB)
-MIN_VRAM_BYTES = 3 * 1024 * 1024 * 1024
+# Model configuration - optimized for 24GB VRAM
+MODEL_ID = "distil-large-v3"  # 6.3x faster, low hallucination
+COMPUTE_TYPE = "float16"      # Better quality with 24GB VRAM available
+BEAM_SIZE = 5                 # Better accuracy with more VRAM headroom
+
+# VAD filters silence to prevent hallucination ("thank you", etc.)
+VAD_ENABLED = True
+VAD_THRESHOLD = 0.4
+VAD_MIN_SPEECH_MS = 250
+VAD_MIN_SILENCE_MS = 300
+
+# Minimum VRAM required (2GB for distil-large-v3)
+MIN_VRAM_BYTES = 2 * 1024 * 1024 * 1024
 
 # Set up CUDA environment
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-# Suppress NeMo/PyTorch warnings
+# Suppress warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -93,26 +104,19 @@ def write_status(status: str):
 
 
 def check_gpu_available():
-    """Check if CUDA GPU is available and has enough memory.
-
-    Returns:
-        tuple: (available: bool, message: str)
-    """
+    """Check if CUDA GPU is available and has enough memory."""
     try:
         import torch
 
         if not torch.cuda.is_available():
             return False, "CUDA not available - check NVIDIA drivers"
 
-        # Check device count
         device_count = torch.cuda.device_count()
         if device_count == 0:
             return False, "No CUDA devices found"
 
-        # Check VRAM
         device_props = torch.cuda.get_device_properties(0)
         total_mem = device_props.total_memory
-        # Note: memory_allocated() is 0 before we load anything, so just check total
         if total_mem < MIN_VRAM_BYTES:
             return False, f"Insufficient VRAM: {total_mem // (1024**2)}MB (need {MIN_VRAM_BYTES // (1024**2)}MB)"
 
@@ -125,24 +129,21 @@ def check_gpu_available():
 
 
 def load_model():
-    """Load the Parakeet TDT model with error handling.
-
-    Returns:
-        tuple: (model or None, error_message or None)
-    """
+    """Load the faster-whisper model with Silero VAD."""
     try:
-        import nemo.collections.asr as nemo_asr
+        from faster_whisper import WhisperModel
 
-        print("  Downloading/loading Parakeet TDT 0.6B v2...", flush=True)
-        model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
-        model.eval()
-        model.cuda()
+        print(f"  Downloading/loading {MODEL_ID}...", flush=True)
+        model = WhisperModel(
+            MODEL_ID,
+            device="cuda",
+            compute_type=COMPUTE_TYPE,
+        )
         return model, None
 
     except ImportError as e:
-        return None, f"NeMo ASR not installed: {e}"
+        return None, f"faster-whisper not installed: {e}"
     except RuntimeError as e:
-        # CUDA OOM or other runtime errors
         error_str = str(e)
         if "out of memory" in error_str.lower():
             return None, "GPU out of memory - close other GPU applications"
@@ -230,23 +231,17 @@ def preprocess_audio(audio_path: str) -> str:
         import numpy as np
         import soundfile as sf
 
-        # Load audio
         data, rate = sf.read(audio_path)
-
-        # Apply noise reduction (prop_decrease=0.8 removes 80% of detected noise)
         reduced = nr.reduce_noise(y=data, sr=rate, prop_decrease=0.8)
-
-        # Save to temp file
         clean_path = audio_path + ".clean.wav"
         sf.write(clean_path, reduced, rate)
-
         return clean_path
     except ImportError:
         print("Warning: noisereduce not installed, skipping noise reduction", file=sys.stderr, flush=True)
         return audio_path
     except Exception as e:
         print(f"Noise reduction failed: {e}", file=sys.stderr, flush=True)
-        return audio_path  # Fall back to original
+        return audio_path
 
 
 def remove_fillers(text: str) -> str:
@@ -285,8 +280,84 @@ def process_punctuation(text: str) -> str:
         return text.strip()
 
 
+# Dictionary cache
+_dictionary_cache = {"mtime": 0, "entries": []}
+
+
+def load_dictionary():
+    """Load custom dictionary entries, using mtime cache to avoid re-reading."""
+    try:
+        if not os.path.exists(DICTIONARY_PATH):
+            _dictionary_cache["entries"] = []
+            _dictionary_cache["mtime"] = 0
+            return _dictionary_cache["entries"]
+
+        mtime = os.path.getmtime(DICTIONARY_PATH)
+        if mtime == _dictionary_cache["mtime"]:
+            return _dictionary_cache["entries"]
+
+        with open(DICTIONARY_PATH, 'r') as f:
+            data = json.load(f)
+
+        # Accept both flat array and wrapped {"entries": [...]} format
+        if isinstance(data, list):
+            raw_entries = data
+        elif isinstance(data, dict):
+            raw_entries = data.get("entries", [])
+        else:
+            raw_entries = []
+
+        entries = []
+        for entry in raw_entries:
+            spoken = entry.get("spoken", "").strip()
+            replacement = entry.get("replacement", "")
+            if spoken:
+                pattern = re.compile(r'\b' + re.escape(spoken) + r'\b', re.IGNORECASE)
+                entries.append((pattern, replacement))
+
+        _dictionary_cache["entries"] = entries
+        _dictionary_cache["mtime"] = mtime
+        return entries
+
+    except Exception as e:
+        print(f"Warning: Failed to load dictionary: {e}", file=sys.stderr, flush=True)
+        return _dictionary_cache["entries"]
+
+
+def get_dictionary_prompt():
+    """Build initial_prompt and hotwords from dictionary replacements."""
+    entries = load_dictionary()
+    if not entries:
+        return None, None
+
+    words = set()
+    for _pattern, replacement in entries:
+        for word in replacement.split():
+            cleaned = word.strip('.,!?;:()[]{}"\'-')
+            if cleaned:
+                words.add(cleaned)
+
+    if not words:
+        return None, None
+
+    word_list = sorted(words)
+    initial_prompt = "Glossary: " + ", ".join(word_list) + "."
+    hotwords = " ".join(word_list)
+    return initial_prompt, hotwords
+
+
+def apply_dictionary(text: str) -> str:
+    """Apply custom dictionary replacements (case-insensitive whole-word)."""
+    entries = load_dictionary()
+    if not entries:
+        return text
+    for pattern, replacement in entries:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def warmup_model(model):
-    """Warm up the Parakeet model for fastest first transcription."""
+    """Warm up the model for fastest first transcription."""
     try:
         import numpy as np
         import tempfile
@@ -294,9 +365,8 @@ def warmup_model(model):
 
         print("  Warming up CUDA kernels...", flush=True)
 
-        # Create a temporary audio file with silence for warmup
         sample_rate = 16000
-        duration = 1.0  # 1 second
+        duration = 1.0
         silence = np.zeros(int(sample_rate * duration), dtype=np.float32)
 
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -304,9 +374,9 @@ def warmup_model(model):
             sf.write(temp_path, silence, sample_rate)
 
         try:
-            # Run 3 warmup passes
             for i in range(3):
-                model.transcribe([temp_path])
+                segments, _ = model.transcribe(temp_path, beam_size=BEAM_SIZE)
+                list(segments)  # Consume generator
         finally:
             try:
                 os.unlink(temp_path)
@@ -351,15 +421,30 @@ def handle_request(model, conn, data):
         # Apply noise reduction if enabled
         clean_audio_path = preprocess_audio(audio_path)
 
-        # Transcribe with Parakeet - returns list of Hypothesis objects
-        # Parakeet includes punctuation and capitalization automatically
-        result = model.transcribe([clean_audio_path])
-        if result and len(result) > 0:
-            # Handle both string and Hypothesis object returns
-            hyp = result[0]
-            text = hyp.text if hasattr(hyp, 'text') else str(hyp)
-        else:
-            text = ""
+        # Build prompt hints from dictionary
+        initial_prompt, hotwords = get_dictionary_prompt()
+
+        # Transcribe with faster-whisper + VAD to filter silence
+        segments, info = model.transcribe(
+            clean_audio_path,
+            beam_size=BEAM_SIZE,
+            language="en",
+            vad_filter=VAD_ENABLED,
+            vad_parameters={
+                "threshold": VAD_THRESHOLD,
+                "min_speech_duration_ms": VAD_MIN_SPEECH_MS,
+                "min_silence_duration_ms": VAD_MIN_SILENCE_MS,
+            } if VAD_ENABLED else None,
+            condition_on_previous_text=False,  # Prevents hallucination loops
+            initial_prompt=initial_prompt,     # Biases decoder toward dictionary words
+            hotwords=hotwords,                 # faster-whisper: re-applies on each segment
+        )
+
+        # Collect all segment texts
+        text_parts = []
+        for segment in segments:
+            text_parts.append(segment.text.strip())
+        text = " ".join(text_parts)
 
         # Clean up noise-reduced temp file if it was created
         if clean_audio_path != audio_path and os.path.exists(clean_audio_path):
@@ -369,13 +454,14 @@ def handle_request(model, conn, data):
                 pass
 
         # Post-process
-        text = process_punctuation(text)  # Convert spoken commands
+        text = process_punctuation(text)
         text = remove_fillers(text)
+        text = apply_dictionary(text)
 
         duration_ms = int((time.time() - start_time) * 1000)
 
-        if text:
-            log_dictation(text, duration_ms, audio_duration_ms, "en", mode)
+        if text and "/whisper-stream" not in audio_path:
+            log_dictation(text, duration_ms, audio_duration_ms, info.language if info else "en", mode)
 
         conn.sendall(text.encode())
 
@@ -406,7 +492,7 @@ def main():
     print(f"  {gpu_msg}", flush=True)
 
     # Load model
-    print("Loading Parakeet TDT model into VRAM...", flush=True)
+    print(f"Loading faster-whisper ({MODEL_ID}) into VRAM...", flush=True)
     print("  (This may take a moment on first run to download the model)", flush=True)
 
     model, error = load_model()
@@ -456,6 +542,7 @@ def main():
     # Mark as ready
     write_status("ready")
     print(f"Ready! Listening on {SOCKET_PATH}", flush=True)
+    print(f"Using: {MODEL_ID} (VAD={'enabled' if VAD_ENABLED else 'disabled'}, {COMPUTE_TYPE}, beam={BEAM_SIZE})", flush=True)
 
     while True:
         conn = None

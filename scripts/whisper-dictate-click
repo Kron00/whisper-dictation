@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Wrapper for whisper-dictate that detects double vs triple click
+# Double-click: normal paste
+# Triple-click: paste + Enter
+set -euo pipefail
+
+CLICK_FILE="/tmp/whisper-click-times"
+TRIPLE_FLAG="/tmp/whisper-triple-click"
+CLICK_WINDOW_MS=500
+
+now=$(date +%s%3N)
+
+# Read recent clicks
+clicks=()
+if [[ -f "$CLICK_FILE" ]]; then
+    while read -r ts; do
+        # Only keep clicks within window
+        if (( now - ts < CLICK_WINDOW_MS )); then
+            clicks+=("$ts")
+        fi
+    done < "$CLICK_FILE"
+fi
+
+# Add current click
+clicks+=("$now")
+
+# Write back
+printf '%s\n' "${clicks[@]}" > "$CLICK_FILE"
+
+# Count clicks in window
+count=${#clicks[@]}
+
+if (( count >= 3 )); then
+    # Triple click - set flag and trigger
+    touch "$TRIPLE_FLAG"
+    rm -f "$CLICK_FILE"
+    exec ~/.local/bin/whisper-dictate
+elif (( count == 2 )); then
+    # Double click - normal trigger
+    rm -f "$TRIPLE_FLAG"
+    rm -f "$CLICK_FILE"
+    exec ~/.local/bin/whisper-dictate
+fi
+
+# Single click - wait for more

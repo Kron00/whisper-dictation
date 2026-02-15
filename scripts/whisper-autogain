@@ -14,12 +14,21 @@ RESTORE_FILE = Path("/tmp/whisper-autogain-restore")
 
 # Target levels (in dB)
 TARGET_PEAK_DB = -9.0      # Ideal peak level
+TARGET_RMS_DB = -18.0      # Ideal RMS level for speech
 MIN_PEAK_DB = -20.0        # Too quiet threshold
 MAX_PEAK_DB = -3.0         # Too loud threshold
-ADJUSTMENT_STEP = 0.05     # 5% adjustment per learning cycle
+CLIPPING_THRESHOLD = 32500 # Catches soft clipping (was 32760)
+
+# Adjustment steps (proportional based on error)
+BASE_STEP = 0.05           # Fine-tuning (<5dB off)
+FAST_STEP = 0.15           # Normal adjustment (5-10dB off)
+VERY_FAST_STEP = 0.20      # Large adjustment (>10dB off)
+
 MIN_VOLUME = 0.30          # Never go below 30%
 MAX_VOLUME = 1.00          # Never exceed 100%
 DEFAULT_VOLUME = 0.70      # Starting point
+
+CALIBRATION_DURATION = 3   # Seconds for calibration recording
 
 def get_current_volume():
     """Get current mic volume via wpctl."""
@@ -58,8 +67,18 @@ def analyze_audio(wav_path):
         rms_ratio = rms / 32768.0
         rms_db = 20 * math.log10(rms_ratio) if rms_ratio > 0 else -96
 
-        # Detect clipping (samples at max value)
-        clipping = peak >= 32760
+        # Detect clipping - check for consecutive samples at/near max
+        # 3+ consecutive high samples indicates actual clipping vs one-off spike
+        clipping = False
+        consecutive_high = 0
+        for s in samples:
+            if abs(s) >= CLIPPING_THRESHOLD:
+                consecutive_high += 1
+                if consecutive_high >= 3:
+                    clipping = True
+                    break
+            else:
+                consecutive_high = 0
 
         return {
             "peak_db": peak_db,
@@ -100,6 +119,16 @@ def cmd_restore():
         except (ValueError, OSError):
             pass
 
+def get_adjustment_step(error_db):
+    """Return adjustment step based on how far from target."""
+    abs_error = abs(error_db)
+    if abs_error > 10:
+        return VERY_FAST_STEP
+    elif abs_error > 5:
+        return FAST_STEP
+    else:
+        return BASE_STEP
+
 def cmd_learn(wav_path):
     """Learn from a recording and adjust optimal volume."""
     analysis = analyze_audio(wav_path)
@@ -109,13 +138,27 @@ def cmd_learn(wav_path):
     config = load_config()
     current_optimal = config.get("optimal_volume", DEFAULT_VOLUME)
 
-    # Determine adjustment
+    # Calculate weighted error (70% peak, 30% RMS)
+    peak_error = analysis["peak_db"] - TARGET_PEAK_DB
+    rms_error = analysis["rms_db"] - TARGET_RMS_DB
+    weighted_error = 0.7 * peak_error + 0.3 * rms_error
+
+    # Determine adjustment with proportional step size
     if analysis["clipping"] or analysis["peak_db"] > MAX_PEAK_DB:
-        # Too loud - decrease
-        new_optimal = current_optimal - ADJUSTMENT_STEP
+        # Too loud - decrease (use peak error for step size)
+        step = get_adjustment_step(peak_error)
+        new_optimal = current_optimal - step
     elif analysis["peak_db"] < MIN_PEAK_DB:
-        # Too quiet - increase
-        new_optimal = current_optimal + ADJUSTMENT_STEP
+        # Too quiet - increase (use weighted error for step size)
+        step = get_adjustment_step(weighted_error)
+        new_optimal = current_optimal + step
+    elif abs(weighted_error) > 3:
+        # Not quite optimal - fine tune based on weighted error direction
+        step = get_adjustment_step(weighted_error)
+        if weighted_error > 0:
+            new_optimal = current_optimal - step
+        else:
+            new_optimal = current_optimal + step
     else:
         # Good level - no change
         new_optimal = current_optimal
@@ -126,7 +169,120 @@ def cmd_learn(wav_path):
     # Save
     config["optimal_volume"] = new_optimal
     config["last_analysis"] = analysis
+    config["last_error_db"] = weighted_error
     save_config(config)
+
+def cmd_calibrate():
+    """One-time calibration: record user speaking and set optimal level."""
+    import tempfile
+    import time
+    import signal
+
+    print("🎙️  Calibration: Speak normally for 3 seconds...")
+    print("    Recording starts in 1 second...")
+    time.sleep(1)
+
+    # Set to middle volume for calibration
+    set_volume(0.70)
+
+    # Record calibration audio
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    print("    🔴 Recording NOW - speak at normal volume!")
+    proc = subprocess.Popen(
+        ["pw-record", "--target=@DEFAULT_AUDIO_SOURCE@",
+         "--format=s16", "--rate=16000", "--channels=1", tmp_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    # Wait for recording duration
+    time.sleep(CALIBRATION_DURATION)
+
+    # Send SIGINT so pw-record writes WAV header properly before exiting
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    time.sleep(0.1)  # Let file be written
+
+    # Analyze the recording
+    analysis = analyze_audio(tmp_path)
+    if not analysis:
+        print("❌ Calibration failed: no audio captured")
+        Path(tmp_path).unlink(missing_ok=True)
+        return
+
+    # Calculate optimal volume from calibration
+    # If peak was at -15dB and we want -9dB, we need +6dB
+    # +6dB = multiply by 2, so increase volume proportionally
+    peak_error = TARGET_PEAK_DB - analysis["peak_db"]
+    # Convert dB to linear multiplier: 10^(dB/20)
+    multiplier = 10 ** (peak_error / 20)
+    optimal = 0.70 * multiplier  # 0.70 was our test volume
+
+    # Clamp
+    optimal = max(MIN_VOLUME, min(MAX_VOLUME, optimal))
+
+    # Save
+    config = load_config()
+    config["optimal_volume"] = optimal
+    config["calibrated"] = True
+    config["calibration_analysis"] = analysis
+    save_config(config)
+
+    print(f"✅ Calibration complete!")
+    print(f"   Peak: {analysis['peak_db']:.1f}dB, RMS: {analysis['rms_db']:.1f}dB")
+    print(f"   Optimal volume set to: {optimal:.0%}")
+
+    # Clean up
+    Path(tmp_path).unlink(missing_ok=True)
+
+def cmd_check():
+    """Quick pre-recording level check (~150ms). Returns exit code 0 if OK."""
+    import tempfile
+    import os
+
+    # Quick 100ms sample
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        proc = subprocess.Popen(
+            ["pw-record", "--target=@DEFAULT_AUDIO_SOURCE@",
+             "--format=s16", "--rate=16000", "--channels=1", tmp_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        import time
+        time.sleep(0.1)  # 100ms sample
+        proc.terminate()
+        proc.wait(timeout=0.5)
+    except:
+        Path(tmp_path).unlink(missing_ok=True)
+        return  # Silent failure, don't block recording
+
+    analysis = analyze_audio(tmp_path)
+    Path(tmp_path).unlink(missing_ok=True)
+
+    if not analysis:
+        return  # Can't analyze, proceed anyway
+
+    config = load_config()
+    current_optimal = config.get("optimal_volume", DEFAULT_VOLUME)
+
+    # Check if wildly off (>15dB from target)
+    error = abs(analysis["peak_db"] - TARGET_PEAK_DB)
+    if error > 15:
+        # Immediate correction
+        peak_error = TARGET_PEAK_DB - analysis["peak_db"]
+        multiplier = 10 ** (peak_error / 20)
+        new_optimal = get_current_volume() * multiplier
+        new_optimal = max(MIN_VOLUME, min(MAX_VOLUME, new_optimal))
+        set_volume(new_optimal)
+        config["optimal_volume"] = new_optimal
+        save_config(config)
 
 def cmd_status():
     """Show current status."""
@@ -134,9 +290,15 @@ def cmd_status():
     current = get_current_volume()
     print(f"Current mic volume: {current:.0%}")
     print(f"Saved optimal: {config.get('optimal_volume', DEFAULT_VOLUME):.0%}")
+    if config.get("calibrated"):
+        print("Calibration: ✅ Done")
+    else:
+        print("Calibration: ❌ Not done (run 'calibrate' for best results)")
     if "last_analysis" in config:
         a = config["last_analysis"]
-        print(f"Last recording: peak={a['peak_db']:.1f}dB, clipping={a['clipping']}")
+        print(f"Last recording: peak={a['peak_db']:.1f}dB, rms={a['rms_db']:.1f}dB, clipping={a['clipping']}")
+    if "last_error_db" in config:
+        print(f"Last error: {config['last_error_db']:.1f}dB from target")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -147,7 +309,11 @@ if __name__ == "__main__":
         cmd_restore()
     elif sys.argv[1] == "learn" and len(sys.argv) > 2:
         cmd_learn(sys.argv[2])
+    elif sys.argv[1] == "calibrate":
+        cmd_calibrate()
+    elif sys.argv[1] == "check":
+        cmd_check()
     elif sys.argv[1] == "status":
         cmd_status()
     else:
-        print("Usage: whisper-autogain [apply|restore|learn <wav>|status]")
+        print("Usage: whisper-autogain [apply|restore|learn <wav>|calibrate|check|status]")

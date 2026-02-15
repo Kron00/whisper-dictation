@@ -3,17 +3,34 @@
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, GLib, Pango
+from gi.repository import Gtk, Adw, GLib, Gio, Pango
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 import os
 
 STATS_DB = os.path.expanduser("~/.local/share/whisper-dictation/stats.db")
+DICTIONARY_PATH = os.path.expanduser("~/.config/whisper-dictation/dictionary.json")
 
-# Average typing speed: 60 WPM, speaking: 150 WPM (fallback estimate)
-TYPING_WPM = 60
-SPEAKING_WPM = 150
+# Typing: 300 chars/min (60 WPM × 5 chars/word standard)
+# Speaking fallback: 142 WPM (measured from actual dictations)
+TYPING_CPM = 300
+SPEAKING_WPM = 142
+
+
+def load_dictionary():
+    try:
+        with open(DICTIONARY_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_dictionary(entries):
+    os.makedirs(os.path.dirname(DICTIONARY_PATH), exist_ok=True)
+    with open(DICTIONARY_PATH, 'w') as f:
+        json.dump(entries, f, indent=2)
 
 
 class StatsWindow(Adw.ApplicationWindow):
@@ -25,25 +42,56 @@ class StatsWindow(Adw.ApplicationWindow):
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(main_box)
 
-        # Header bar
+        # Header bar with ViewSwitcher
         header = Adw.HeaderBar()
-        header.set_title_widget(Adw.WindowTitle(title="WhisperStats", subtitle="Dictation Statistics"))
+        self.view_stack = Adw.ViewStack()
+        switcher_title = Adw.ViewSwitcherTitle()
+        switcher_title.set_stack(self.view_stack)
+        header.set_title_widget(switcher_title)
 
         # Refresh button
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
-        refresh_btn.connect("clicked", lambda _: self.refresh_stats())
+        refresh_btn.connect("clicked", lambda _: (self.refresh_stats(), self.refresh_dictionary()))
         refresh_btn.set_tooltip_text("Refresh")
         header.pack_end(refresh_btn)
 
         main_box.append(header)
 
-        # Scrollable content
+        # ViewSwitcherBar for narrow widths
+        switcher_bar = Adw.ViewSwitcherBar()
+        switcher_bar.set_stack(self.view_stack)
+        switcher_title.connect("notify::title-visible", lambda t, _: switcher_bar.set_reveal(t.get_title_visible()))
+
+        # Stats page
+        stats_page = self._build_stats_page()
+        self.view_stack.add_titled_with_icon(stats_page, "stats", "Stats", "utilities-system-monitor-symbolic")
+
+        # Dictionary page
+        dict_page = self._build_dictionary_page()
+        self.view_stack.add_titled_with_icon(dict_page, "dictionary", "Dictionary", "accessories-dictionary-symbolic")
+
+        main_box.append(self.view_stack)
+        main_box.append(switcher_bar)
+
+        # Load initial data
+        self.refresh_stats()
+        self.refresh_dictionary()
+
+        # Watch database for changes (instant updates on new dictations)
+        self._refresh_pending = False
+        self._change_received = False
+        db_file = Gio.File.new_for_path(STATS_DB)
+        self._db_monitor = db_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
+        self._db_monitor.connect("changed", self._on_db_changed)
+
+        # Auto-refresh every 30 seconds as fallback
+        GLib.timeout_add_seconds(30, self._auto_refresh)
+
+    def _build_stats_page(self):
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        main_box.append(scroll)
 
-        # Content box with margin
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         content.set_margin_top(12)
         content.set_margin_bottom(12)
@@ -51,7 +99,6 @@ class StatsWindow(Adw.ApplicationWindow):
         content.set_margin_end(12)
         scroll.set_child(content)
 
-        # Stats cards
         self.cards = {}
 
         # Today's stats group
@@ -107,14 +154,130 @@ class StatsWindow(Adw.ApplicationWindow):
         self.recent_list.add_css_class("boxed-list")
         recent_group.add(self.recent_list)
 
-        # Load initial stats
-        self.refresh_stats()
+        return scroll
 
-        # Auto-refresh every 30 seconds
-        GLib.timeout_add_seconds(30, self._auto_refresh)
+    def _build_dictionary_page(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+        scroll.set_child(content)
+
+        # Dictionary group
+        self.dict_group = Adw.PreferencesGroup(title="Custom Dictionary")
+        self.dict_group.set_description("Words that Whisper often gets wrong. Replacements are applied after transcription.")
+        content.append(self.dict_group)
+
+        # Add button
+        add_btn = Gtk.Button(label="Add Entry")
+        add_btn.add_css_class("suggested-action")
+        add_btn.add_css_class("pill")
+        add_btn.set_halign(Gtk.Align.CENTER)
+        add_btn.connect("clicked", self._on_add_entry)
+        self.dict_group.add(add_btn)
+
+        # List box for entries
+        self.dict_list = Gtk.ListBox()
+        self.dict_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.dict_list.add_css_class("boxed-list")
+        self.dict_group.add(self.dict_list)
+
+        # Empty state
+        self.dict_empty = Adw.StatusPage()
+        self.dict_empty.set_icon_name("accessories-dictionary-symbolic")
+        self.dict_empty.set_title("No Dictionary Entries")
+        self.dict_empty.set_description("Add words that Whisper often mistranscribes.")
+        self.dict_empty.set_visible(False)
+        content.append(self.dict_empty)
+
+        return scroll
+
+    def refresh_dictionary(self):
+        # Clear existing rows
+        while True:
+            child = self.dict_list.get_first_child()
+            if child is None:
+                break
+            self.dict_list.remove(child)
+
+        entries = load_dictionary()
+
+        if not entries:
+            self.dict_list.set_visible(False)
+            self.dict_empty.set_visible(True)
+            return
+
+        self.dict_list.set_visible(True)
+        self.dict_empty.set_visible(False)
+
+        for entry in entries:
+            spoken = entry.get("spoken", "")
+            replacement = entry.get("replacement", "")
+
+            row = Adw.ActionRow()
+            row.set_title(GLib.markup_escape_text(spoken))
+            row.set_subtitle(GLib.markup_escape_text(f"\u2192 {replacement}"))
+            row.add_prefix(Gtk.Image(icon_name="document-edit-symbolic"))
+
+            delete_btn = Gtk.Button(icon_name="user-trash-symbolic")
+            delete_btn.set_valign(Gtk.Align.CENTER)
+            delete_btn.add_css_class("flat")
+            delete_btn.add_css_class("error")
+            delete_btn.connect("clicked", self._on_delete_entry, spoken)
+            row.add_suffix(delete_btn)
+
+            self.dict_list.append(row)
+
+    def _on_add_entry(self, _btn):
+        dialog = Adw.AlertDialog()
+        dialog.set_heading("Add Dictionary Entry")
+        dialog.set_body("Enter the spoken word and its replacement.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("add", "Add")
+        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("add")
+        dialog.set_close_response("cancel")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+        spoken_entry = Gtk.Entry()
+        spoken_entry.set_placeholder_text("Spoken word (e.g. ghosty)")
+        box.append(spoken_entry)
+
+        replacement_entry = Gtk.Entry()
+        replacement_entry.set_placeholder_text("Replacement (e.g. Gh0sty)")
+        box.append(replacement_entry)
+
+        dialog.set_extra_child(box)
+
+        def on_response(d, response):
+            if response == "add":
+                spoken = spoken_entry.get_text().strip()
+                replacement = replacement_entry.get_text().strip()
+                if spoken and replacement:
+                    entries = load_dictionary()
+                    entries.append({"spoken": spoken, "replacement": replacement})
+                    save_dictionary(entries)
+                    self.refresh_dictionary()
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def _on_delete_entry(self, _btn, spoken_word):
+        entries = load_dictionary()
+        entries = [e for e in entries if e.get("spoken") != spoken_word]
+        save_dictionary(entries)
+        self.refresh_dictionary()
 
     def _create_stat_row(self, title, value, icon_name):
-        """Create an ActionRow for a statistic."""
         row = Adw.ActionRow(title=title)
         row.add_prefix(Gtk.Image(icon_name=icon_name))
 
@@ -125,16 +288,31 @@ class StatsWindow(Adw.ApplicationWindow):
 
         return row
 
-    def _auto_refresh(self):
-        """Auto-refresh callback."""
+    def _on_db_changed(self, monitor, file, other_file, event_type):
+        self._change_received = True
+        if not self._refresh_pending:
+            self._refresh_pending = True
+            GLib.timeout_add(500, self._debounced_refresh)
+
+    def _debounced_refresh(self):
+        self._change_received = False
         self.refresh_stats()
-        return True  # Continue timer
+        if self._change_received:
+            # Events arrived during refresh, schedule another
+            GLib.timeout_add(500, self._debounced_refresh)
+        else:
+            self._refresh_pending = False
+        return False
+
+    def _auto_refresh(self):
+        self.refresh_stats()
+        return True
 
     def refresh_stats(self):
-        """Refresh all statistics from database."""
         if not Path(STATS_DB).exists():
             return
 
+        conn = None
         try:
             conn = sqlite3.connect(STATS_DB)
             cursor = conn.cursor()
@@ -142,35 +320,49 @@ class StatsWindow(Adw.ApplicationWindow):
             # Today's stats
             today = datetime.now().date().isoformat()
             cursor.execute(
-                "SELECT COUNT(*), SUM(word_count), SUM(audio_duration_ms) FROM dictations WHERE date(timestamp) = ?",
+                "SELECT COUNT(*), SUM(word_count) FROM dictations WHERE date(timestamp) = ?",
                 (today,)
             )
             row = cursor.fetchone()
             dictations_today = row[0] or 0
             words_today = row[1] or 0
-            audio_ms_today = row[2] or 0
 
             self.cards['words_today']._value_label.set_text(f"{words_today:,}")
             self.cards['dictations_today']._value_label.set_text(str(dictations_today))
 
-            # Time saved calculation (typing vs actual speaking time)
-            speak_time_today = audio_ms_today / 60000 if audio_ms_today > 0 else None
-            time_saved_today = self._calc_time_saved(words_today, speak_time_today)
+            # Time saved: use character count for typing time, split by audio tracking
+            cursor.execute("""
+                SELECT
+                    SUM(CASE WHEN audio_duration_ms > 0 THEN LENGTH(text) ELSE 0 END),
+                    SUM(CASE WHEN audio_duration_ms > 0 THEN audio_duration_ms ELSE 0 END),
+                    SUM(CASE WHEN audio_duration_ms IS NULL OR audio_duration_ms = 0 THEN LENGTH(text) ELSE 0 END),
+                    SUM(CASE WHEN audio_duration_ms IS NULL OR audio_duration_ms = 0 THEN word_count ELSE 0 END)
+                FROM dictations WHERE date(timestamp) = ?
+            """, (today,))
+            row = cursor.fetchone()
+            time_saved_today = self._calc_time_saved(row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0)
             self.cards['time_saved_today']._value_label.set_text(time_saved_today)
 
             # All time stats
-            cursor.execute("SELECT COUNT(*), SUM(word_count), SUM(audio_duration_ms) FROM dictations")
+            cursor.execute("SELECT COUNT(*), SUM(word_count) FROM dictations")
             row = cursor.fetchone()
             dictations_total = row[0] or 0
             words_total = row[1] or 0
-            audio_ms_total = row[2] or 0
 
             self.cards['words_total']._value_label.set_text(f"{words_total:,}")
             self.cards['dictations_total']._value_label.set_text(f"{dictations_total:,}")
 
-            # Time saved calculation (typing vs actual speaking time)
-            speak_time_total = audio_ms_total / 60000 if audio_ms_total > 0 else None
-            time_saved_total = self._calc_time_saved(words_total, speak_time_total)
+            # Time saved: use character count for typing time, split by audio tracking
+            cursor.execute("""
+                SELECT
+                    SUM(CASE WHEN audio_duration_ms > 0 THEN LENGTH(text) ELSE 0 END),
+                    SUM(CASE WHEN audio_duration_ms > 0 THEN audio_duration_ms ELSE 0 END),
+                    SUM(CASE WHEN audio_duration_ms IS NULL OR audio_duration_ms = 0 THEN LENGTH(text) ELSE 0 END),
+                    SUM(CASE WHEN audio_duration_ms IS NULL OR audio_duration_ms = 0 THEN word_count ELSE 0 END)
+                FROM dictations
+            """)
+            row = cursor.fetchone()
+            time_saved_total = self._calc_time_saved(row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0)
             self.cards['time_saved_total']._value_label.set_text(time_saved_total)
 
             avg_words = words_total / dictations_total if dictations_total > 0 else 0
@@ -188,7 +380,7 @@ class StatsWindow(Adw.ApplicationWindow):
                 self.cards['speaking_wpm']._value_label.set_text("-- WPM")
 
             # This week stats
-            week_ago = (datetime.now() - timedelta(days=7)).date().isoformat()
+            week_ago = (datetime.now() - timedelta(days=6)).date().isoformat()
             cursor.execute(
                 "SELECT SUM(word_count) FROM dictations WHERE date(timestamp) >= ?",
                 (week_ago,)
@@ -237,48 +429,38 @@ class StatsWindow(Adw.ApplicationWindow):
                 self.recent_list.remove(child)
 
             for timestamp, text, word_count in recent:
-                # Parse and format timestamp
                 try:
                     dt = datetime.fromisoformat(timestamp)
                     time_str = dt.strftime("%H:%M")
                     date_str = dt.strftime("%b %d")
-                except:
+                except (ValueError, TypeError):
                     time_str = ""
                     date_str = ""
 
-                # Truncate long text
                 display_text = text[:80] + "..." if len(text) > 80 else text
 
-                row = Adw.ActionRow(
-                    title=display_text,
-                    subtitle=f"{date_str} {time_str} · {word_count} words"
-                )
+                row = Adw.ActionRow()
+                row.set_title(GLib.markup_escape_text(display_text))
+                row.set_subtitle(f"{date_str} {time_str} \u00b7 {word_count} words")
                 self.recent_list.append(row)
-
-            conn.close()
 
         except Exception as e:
             print(f"Error loading stats: {e}")
+        finally:
+            if conn:
+                conn.close()
 
-    def _calc_time_saved(self, words, actual_speak_time_min=None):
-        """Calculate time saved by speaking vs typing.
-
-        Args:
-            words: Number of words dictated
-            actual_speak_time_min: Actual speaking time in minutes (from audio duration)
-        """
-        if words == 0:
+    def _calc_time_saved(self, chars_with_audio, audio_ms, chars_without_audio, words_without_audio):
+        total_chars = chars_with_audio + chars_without_audio
+        if total_chars == 0:
             return "0 min"
 
-        # Time to type (minutes)
-        type_time = words / TYPING_WPM
-        # Time to speak (minutes) - use actual if available, otherwise estimate
-        if actual_speak_time_min and actual_speak_time_min > 0:
-            speak_time = actual_speak_time_min
-        else:
-            speak_time = words / SPEAKING_WPM
-        # Time saved
-        saved = type_time - speak_time
+        # Typing time: actual character count at 300 chars/min
+        # Speaking time: actual audio duration (tracked) or word-based estimate (untracked)
+        saved_tracked = (chars_with_audio / TYPING_CPM) - (audio_ms / 60000) if chars_with_audio > 0 else 0
+        saved_untracked = (chars_without_audio / TYPING_CPM) - (words_without_audio / SPEAKING_WPM) if chars_without_audio > 0 else 0
+
+        saved = max(0, saved_tracked + saved_untracked)
 
         if saved < 1:
             return f"{int(saved * 60)} sec"
@@ -287,10 +469,11 @@ class StatsWindow(Adw.ApplicationWindow):
         else:
             hours = int(saved // 60)
             mins = int(saved % 60)
+            if mins == 0:
+                return f"{hours}h"
             return f"{hours}h {mins}m"
 
     def _get_language_name(self, code):
-        """Convert language code to name."""
         names = {
             "en": "English",
             "es": "Spanish",

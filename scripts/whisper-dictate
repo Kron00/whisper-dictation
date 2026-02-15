@@ -12,6 +12,7 @@ MODE_FILE="/tmp/whisper-dictate.mode"
 SOCKET_PATH="/tmp/whisper-daemon.sock"
 STATUS_PATH="/tmp/whisper-daemon.status"
 PAUSED_PLAYERS_FILE="/tmp/whisper-paused-players"
+OVERLAY_PID_FILE="/tmp/whisper-flow.pid"
 FLOW_ENABLED_FILE="/tmp/whisper-flow.enabled"
 FLOW_MODE_FILE="/tmp/whisper-flow.mode"  # "regex" (instant) or "llm" (smarter)
 AUTOGAIN_SCRIPT="$HOME/.local/bin/whisper-autogain"
@@ -46,11 +47,11 @@ play_sound() {
 }
 
 cleanup() {
-    rm -f "$PID_FILE" "$STREAM_PID_FILE" "$STATE_FILE" "$AUDIO_FILE" "$LOCK_FILE" "$PAUSED_PLAYERS_FILE" 2>/dev/null || true
+    rm -f "$PID_FILE" "$STREAM_PID_FILE" "$STATE_FILE" "$AUDIO_FILE" "$LOCK_FILE" "$PAUSED_PLAYERS_FILE" "$OVERLAY_PID_FILE" 2>/dev/null || true
 }
 
-# Ensure cleanup runs on unexpected exit
-trap 'rm -f "$LOCK_FILE" 2>/dev/null || true' EXIT
+# Ensure cleanup runs on unexpected exit (lock released automatically by flock)
+trap 'rm -f "$LOCK_FILE" 2>/dev/null || true; exec 200>&-' EXIT
 
 # Check if /tmp has enough free space
 check_tmp_space() {
@@ -202,15 +203,22 @@ stop_streaming() {
 }
 
 pause_audio() {
-    # Save currently playing players, then pause all
-    rm -f "$PAUSED_PLAYERS_FILE"
-    while IFS= read -r player; do
-        status=$(playerctl --player="$player" status 2>/dev/null) || continue
-        if [[ "$status" == "Playing" ]]; then
-            echo "$player" >> "$PAUSED_PLAYERS_FILE"
-        fi
-    done < <(playerctl --list-all 2>/dev/null || true)
-    playerctl --all-players pause 2>/dev/null || true
+    # Run completely in background - never block the main script
+    # Each playerctl command can hang if a player is unresponsive
+    (
+        # Hard timeout on entire operation
+        timeout 1 bash -c '
+            rm -f "$1"
+            # Timeout on --list-all AND individual status checks
+            for player in $(timeout 0.5 playerctl --list-all 2>/dev/null); do
+                status=$(timeout 0.3 playerctl --player="$player" status 2>/dev/null) || continue
+                if [[ "$status" == "Playing" ]]; then
+                    echo "$player" >> "$1"
+                fi
+            done
+            timeout 0.5 playerctl --all-players pause 2>/dev/null
+        ' _ "$PAUSED_PLAYERS_FILE"
+    ) &>/dev/null &
 }
 
 resume_audio() {
@@ -222,13 +230,31 @@ resume_audio() {
     fi
 }
 
-# Prevent multiple transcription processes
-if [[ -f "$LOCK_FILE" ]]; then
-    lock_pid=$(cat "$LOCK_FILE" 2>/dev/null) || lock_pid=""
-    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-        exit 0
+launch_overlay() {
+    # Check if overlay process is already running (resident mode)
+    if [[ -f "$OVERLAY_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$OVERLAY_PID_FILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            return 0  # Already running, state file will make it show
+        fi
+        rm -f "$OVERLAY_PID_FILE"
     fi
-    rm -f "$LOCK_FILE"
+    ~/.local/bin/whisper-flow &>/dev/null &
+    echo $! > "$OVERLAY_PID_FILE"
+}
+
+kill_overlay() {
+    if [[ -f "$OVERLAY_PID_FILE" ]]; then
+        kill "$(cat "$OVERLAY_PID_FILE")" 2>/dev/null || true
+        rm -f "$OVERLAY_PID_FILE"
+    fi
+}
+
+# Use flock for atomic state transitions (fixes double-click race condition)
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    exit 0  # Another instance is running, exit silently
 fi
 
 start_recording() {
@@ -247,8 +273,12 @@ start_recording() {
     pause_audio
     play_sound "$SOUND_START"
 
-    # Apply optimal microphone volume (invisible to user)
-    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" apply 2>/dev/null
+    # Write state and launch overlay early (initializes GTK in parallel with recording setup)
+    echo "recording" > "$STATE_FILE"
+    launch_overlay
+
+    # Apply optimal microphone volume (skip check for speed)
+    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" apply 2>/dev/null || true
 
     pw-record --target=@DEFAULT_AUDIO_SOURCE@ --format=s16 --rate=16000 --channels=1 "$AUDIO_FILE" &
     local record_pid=$!
@@ -257,12 +287,17 @@ start_recording() {
     sleep 0.1
     if ! kill -0 "$record_pid" 2>/dev/null; then
         echo "Error: pw-record failed to start" >&2
+        kill_overlay
+        rm -f "$STATE_FILE"
         resume_audio
         return 1
     fi
 
     echo "$record_pid" > "$PID_FILE"
-    echo "recording" > "$STATE_FILE"
+
+    # Release lock immediately so stop can be triggered
+    flock -u 200
+    rm -f "$LOCK_FILE"
 
     # Start streaming preview in background
     ~/.local/bin/whisper-stream &
@@ -277,18 +312,21 @@ stop_and_transcribe() {
         kill "$(cat "$PID_FILE")" 2>/dev/null || true
         rm -f "$PID_FILE"
     fi
-    rm -f "$STATE_FILE"
+
+    # Switch overlay to transcribing mode (blue bars)
+    echo "transcribing" > "$STATE_FILE"
 
     if [[ ! -f "$AUDIO_FILE" ]] || [[ ! -s "$AUDIO_FILE" ]]; then
+        rm -f "$STATE_FILE"
+        kill_overlay
         cleanup
         return 1
     fi
 
-    echo $$ > "$LOCK_FILE"
-
     # Check daemon health before transcribing
     if ! check_daemon_health; then
-        rm -f "$AUDIO_FILE" "$LOCK_FILE"
+        rm -f "$AUDIO_FILE" "$STATE_FILE"
+        kill_overlay
         resume_audio
         return 1
     fi
@@ -306,12 +344,12 @@ stop_and_transcribe() {
     fi
 
     # Restore original volume immediately (so Discord etc. work right away)
-    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" restore 2>/dev/null
+    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" restore 2>/dev/null || true
 
     # Learn from this recording in background (doesn't block paste)
-    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" learn "$AUDIO_FILE" &>/dev/null &
+    [[ -x "$AUTOGAIN_SCRIPT" ]] && "$AUTOGAIN_SCRIPT" learn "$AUDIO_FILE" &>/dev/null & true
 
-    rm -f "$AUDIO_FILE" "$LOCK_FILE"
+    rm -f "$AUDIO_FILE"
 
     if [[ -n "$text" ]]; then
         # Apply LLM Flow rewrite if enabled
@@ -319,15 +357,36 @@ stop_and_transcribe() {
             text=$(flow_rewrite "$text")
         fi
 
-        echo -n "$text" | wl-copy || true
-        ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 || true  # Ctrl+Shift+V
+        ydotool type -d 0 -H 0 -- "$text" || true
+
     fi
+
+    # Remove state file (overlay hides itself, stays resident for next use)
+    rm -f "$STATE_FILE"
+
+    # Release lock immediately so next recording can start
+    flock -u 200
+    rm -f "$LOCK_FILE"
 
     resume_audio
 }
 
-if [[ -f "$STATE_FILE" ]] && [[ "$(cat "$STATE_FILE")" == "recording" ]]; then
-    stop_and_transcribe
+# Check if actually recording (state file + valid PID)
+if [[ -f "$STATE_FILE" ]] && [[ "$(cat "$STATE_FILE" 2>/dev/null)" == "recording" ]]; then
+    # Verify pw-record is actually running
+    if [[ -f "$PID_FILE" ]]; then
+        pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            stop_and_transcribe
+        else
+            # Stale state - clean up and start fresh
+            rm -f "$STATE_FILE" "$PID_FILE" "$AUDIO_FILE"
+            start_recording
+        fi
+    else
+        rm -f "$STATE_FILE"
+        start_recording
+    fi
 else
     start_recording
 fi

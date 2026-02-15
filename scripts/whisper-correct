@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Whisper Correct: zenity popup to correct last dictation and learn from edits.
+
+Shows a dialog pre-filled with the most recent dictation text. If the user
+edits it and hits OK, word-level substitutions are extracted and saved to
+the dictionary for future transcriptions.
+
+Usage: whisper-correct  (no arguments needed)
+"""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from difflib import SequenceMatcher
+from pathlib import Path
+
+STATS_DB = os.path.expanduser("~/.local/share/whisper-dictation/stats.db")
+DICTIONARY_PATH = os.path.expanduser("~/.config/whisper-dictation/dictionary.json")
+
+
+def get_last_dictation():
+    """Get the most recent dictation text from stats database."""
+    try:
+        conn = sqlite3.connect(STATS_DB)
+        row = conn.execute(
+            "SELECT text FROM dictations ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except (sqlite3.Error, TypeError):
+        return None
+
+
+def load_dictionary():
+    try:
+        with open(DICTIONARY_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return data.get("entries", [])
+        return []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_entries(new_entries):
+    """Save new corrections to dictionary, skipping duplicates. Returns list of added."""
+    entries = load_dictionary()
+    existing = {e.get("spoken", "").lower() for e in entries}
+    added = []
+    for spoken, replacement in new_entries:
+        if spoken.lower() not in existing:
+            entries.append({"spoken": spoken, "replacement": replacement})
+            existing.add(spoken.lower())
+            added.append(f"{spoken} \u2192 {replacement}")
+    if added:
+        Path(DICTIONARY_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(DICTIONARY_PATH, "w") as f:
+            json.dump(entries, f, indent=2)
+    return added
+
+
+def extract_corrections(original, corrected):
+    """Extract word-level substitutions between original and corrected text."""
+    orig_words = original.split()
+    corr_words = corrected.split()
+    matcher = SequenceMatcher(None, orig_words, corr_words)
+    corrections = []
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "replace" and (i2 - i1) == (j2 - j1):
+            for orig, corr in zip(orig_words[i1:i2], corr_words[j1:j2]):
+                orig_clean = orig.strip(".,!?;:()[]{}\"'-").lower()
+                corr_clean = corr.strip(".,!?;:()[]{}\"'-").lower()
+                if orig_clean != corr_clean and orig_clean and corr_clean:
+                    corrections.append(
+                        (
+                            orig.strip(".,!?;:()[]{}\"'-"),
+                            corr.strip(".,!?;:()[]{}\"'-"),
+                        )
+                    )
+    return corrections
+
+
+def notify(message):
+    try:
+        subprocess.run(
+            ["notify-send", "Whisper Correct", message, "--icon=dialog-information"],
+            timeout=5,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def main():
+    original = get_last_dictation()
+    if not original:
+        notify("No recent dictation found")
+        sys.exit(1)
+
+    try:
+        result = subprocess.run(
+            [
+                "zenity",
+                "--entry",
+                "--title=Correct Dictation",
+                "--text=Edit the transcription:",
+                "--entry-text",
+                original,
+                "--width=500",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        sys.exit(1)
+
+    if result.returncode != 0:
+        sys.exit(0)  # User cancelled
+
+    corrected = result.stdout.strip()
+    if not corrected or corrected == original:
+        sys.exit(0)  # No changes
+
+    corrections = extract_corrections(original, corrected)
+    if not corrections:
+        notify("No word-level corrections detected")
+        sys.exit(0)
+
+    added = save_entries(corrections)
+    if added:
+        notify("Learned:\n" + "\n".join(added))
+    else:
+        notify("Corrections already in dictionary")
+
+
+if __name__ == "__main__":
+    main()

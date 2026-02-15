@@ -1,0 +1,16 @@
+[package]
+name = "whisper-flow"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = "0.10"
+libadwaita = "0.8"
+gtk4-layer-shell = { version = "0.7", features = ["v1_3"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

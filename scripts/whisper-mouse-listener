@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Listen for middle-clicks and detect double/triple click
+# Runs as root to access input devices, triggers whisper-dictate as user
+set -euo pipefail
+
+DOUBLE_CLICK_MS=400
+TRIPLE_CLICK_MS=600
+CLICK_TIMES=()
+USER_HOME="/home/julian"
+TRIPLE_FLAG="/tmp/whisper-triple-click"
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*"
+}
+
+trigger_dictate() {
+    local triple="$1"
+    if [[ "$triple" == "true" ]]; then
+        sudo -u julian touch "$TRIPLE_FLAG"
+        log "Triple-click - triggering with Enter flag"
+    else
+        sudo -u julian rm -f "$TRIPLE_FLAG"
+        log "Double-click - triggering normal"
+    fi
+    # Detect the actual Wayland socket (Niri uses wayland-1, not wayland-0)
+    local wayland_sock
+    wayland_sock=$(basename "$(ls /run/user/1000/wayland-[0-9] 2>/dev/null | head -1)" 2>/dev/null) || wayland_sock="wayland-1"
+    sudo -u julian DISPLAY=:0 WAYLAND_DISPLAY="$wayland_sock" \
+        XDG_RUNTIME_DIR="/run/user/1000" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus" \
+        "$USER_HOME/.local/bin/whisper-dictate" &
+}
+
+log "Starting middle-click listener..."
+
+# Use libinput to monitor clicks
+stdbuf -oL libinput debug-events 2>/dev/null | while read -r line; do
+    if [[ "$line" == *"BTN_MIDDLE"*"pressed"* ]]; then
+        now=$(date +%s%3N)
+
+        # Filter old clicks
+        new_times=()
+        for t in "${CLICK_TIMES[@]:-}"; do
+            if (( now - t < TRIPLE_CLICK_MS )); then
+                new_times+=("$t")
+            fi
+        done
+        new_times+=("$now")
+        CLICK_TIMES=("${new_times[@]}")
+
+        count=${#CLICK_TIMES[@]}
+        log "Click detected, count in window: $count"
+
+        if (( count >= 3 )); then
+            trigger_dictate "true"
+            CLICK_TIMES=()
+        elif (( count == 2 )); then
+            # Check time between last two clicks
+            if (( ${#new_times[@]} >= 2 )); then
+                diff=$(( now - new_times[0] ))
+                if (( diff < DOUBLE_CLICK_MS )); then
+                    trigger_dictate "false"
+                    CLICK_TIMES=()
+                fi
+            fi
+        fi
+    fi
+done

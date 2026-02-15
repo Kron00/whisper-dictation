@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Whisper auto-learn: monitors clipboard after dictation for user corrections.
+
+Runs as self-terminating background process. Compares clipboard changes against
+the original dictated text, extracts word substitutions, and saves them to the
+dictionary for future transcriptions.
+
+Usage: whisper-learn "original dictated text" &
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+from difflib import SequenceMatcher
+from pathlib import Path
+
+PID_FILE = "/tmp/whisper-learn.pid"
+DICTIONARY_PATH = os.path.expanduser("~/.config/whisper-dictation/dictionary.json")
+TIMEOUT_SECONDS = 30
+MIN_WORDS = 3
+MIN_SIMILARITY = 0.60
+MAX_SIMILARITY = 0.99
+
+
+def kill_previous():
+    """Kill any previous whisper-learn instance."""
+    try:
+        pid = int(Path(PID_FILE).read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
+
+
+def write_pid():
+    Path(PID_FILE).write_text(str(os.getpid()))
+
+
+def cleanup(signum=None, frame=None):
+    try:
+        os.unlink(PID_FILE)
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+
+
+def load_dictionary():
+    """Load existing dictionary entries."""
+    try:
+        with open(DICTIONARY_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return data.get("entries", [])
+        return []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_entry(spoken, replacement):
+    """Append a new entry to the dictionary file."""
+    entries = load_dictionary()
+
+    # Check for duplicates
+    for entry in entries:
+        if entry.get("spoken", "").lower() == spoken.lower():
+            return False
+
+    entries.append({"spoken": spoken, "replacement": replacement})
+
+    Path(DICTIONARY_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(DICTIONARY_PATH, "w") as f:
+        json.dump(entries, f, indent=2)
+    return True
+
+
+def extract_corrections(original, corrected):
+    """Extract word-level substitutions between original and corrected text."""
+    orig_words = original.split()
+    corr_words = corrected.split()
+
+    matcher = SequenceMatcher(None, orig_words, corr_words)
+    corrections = []
+
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "replace" and (i2 - i1) == (j2 - j1):
+            # 1-to-1 word substitutions
+            for orig, corr in zip(orig_words[i1:i2], corr_words[j1:j2]):
+                # Skip case-only or punctuation-only differences
+                orig_clean = orig.strip(".,!?;:()[]{}\"'-").lower()
+                corr_clean = corr.strip(".,!?;:()[]{}\"'-").lower()
+                if orig_clean != corr_clean and orig_clean and corr_clean:
+                    corrections.append((orig.strip(".,!?;:()[]{}\"'-"),
+                                        corr.strip(".,!?;:()[]{}\"'-")))
+
+    return corrections
+
+
+def notify(message):
+    try:
+        subprocess.run(
+            ["notify-send", "Whisper Learned", message, "--icon=dialog-information"],
+            timeout=5, capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(1)
+
+    original = sys.argv[1].strip()
+    orig_words = original.split()
+
+    if len(orig_words) < MIN_WORDS:
+        sys.exit(0)
+
+    kill_previous()
+    write_pid()
+
+    # Self-terminate after timeout
+    signal.signal(signal.SIGALRM, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.alarm(TIMEOUT_SECONDS)
+
+    # Monitor clipboard changes
+    try:
+        proc = subprocess.Popen(
+            ["wl-paste", "--type", "text/plain", "--watch", "cat"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        cleanup()
+
+    seen = set()
+    buf = []
+
+    try:
+        for line in proc.stdout:
+            decoded = line.decode("utf-8", errors="replace")
+            # wl-paste --watch outputs each clipboard change followed by empty output
+            # Accumulate lines, process on empty or when content looks complete
+            buf.append(decoded.rstrip("\n"))
+
+            # Try processing accumulated buffer
+            clip_text = "\n".join(buf).strip()
+            if not clip_text or clip_text in seen or clip_text == original:
+                continue
+
+            seen.add(clip_text)
+
+            # Check similarity to original
+            similarity = SequenceMatcher(None, original, clip_text).ratio()
+            if similarity < MIN_SIMILARITY or similarity > MAX_SIMILARITY:
+                buf = []
+                continue
+
+            corrections = extract_corrections(original, clip_text)
+            learned = []
+            for spoken, replacement in corrections:
+                if save_entry(spoken, replacement):
+                    learned.append(f"{spoken} → {replacement}")
+
+            if learned:
+                notify("\n".join(learned))
+
+            buf = []
+
+    except Exception:
+        pass
+    finally:
+        proc.terminate()
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

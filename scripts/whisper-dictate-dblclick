@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Double-click wrapper for whisper-dictate
+# Bind this to middle-click - it detects double-clicks and triggers dictation
+set -euo pipefail
+
+TIMESTAMP_FILE="/tmp/whisper-dblclick.timestamp"
+DOUBLE_CLICK_MS=400  # Max time between clicks to count as double-click
+
+current_ms() {
+    date +%s%3N
+}
+
+now=$(current_ms)
+
+# Check if this is the second click of a double-click
+if [[ -f "$TIMESTAMP_FILE" ]]; then
+    last=$(cat "$TIMESTAMP_FILE" 2>/dev/null) || last=0
+    diff=$((now - last))
+
+    if (( diff < DOUBLE_CLICK_MS )); then
+        # Double-click detected! Clear timestamp and trigger dictation
+        rm -f "$TIMESTAMP_FILE"
+        exec ~/.local/bin/whisper-dictate
+    fi
+fi
+
+# First click - save timestamp and wait
+echo "$now" > "$TIMESTAMP_FILE"
+
+# Clean up old timestamp after timeout (in background)
+(
+    sleep 0.5
+    if [[ -f "$TIMESTAMP_FILE" ]]; then
+        saved=$(cat "$TIMESTAMP_FILE" 2>/dev/null) || saved=0
+        if [[ "$saved" == "$now" ]]; then
+            rm -f "$TIMESTAMP_FILE"
+        fi
+    fi
+) &>/dev/null &

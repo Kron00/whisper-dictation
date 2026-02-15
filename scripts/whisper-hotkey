@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Listen for double middle mouse click and trigger whisper-dictate.
+"""Listen for middle mouse clicks and trigger whisper scripts.
+Double middle-click: whisper-dictate (start/stop recording)
+Triple middle-click: whisper-correct (correction dialog)
 Middle clicks are intercepted - use Ctrl+click for new tabs.
 
 Handles mouse disconnection gracefully - waits for reconnection.
 Resilient to device grab failures and enumeration errors."""
+import select
 import subprocess
 import evdev
 from evdev import ecodes, UInput
@@ -26,9 +29,11 @@ except Exception:
         format='%(asctime)s - %(message)s'
     )
 
-SCRIPT = os.path.expanduser("~/.local/bin/whisper-dictate")
-DOUBLE_CLICK_THRESHOLD = 0.3  # 300ms window for double-click
+DICTATE_SCRIPT = os.path.expanduser("~/.local/bin/whisper-dictate")
+CORRECT_SCRIPT = os.path.expanduser("~/.local/bin/whisper-correct")
+CLICK_THRESHOLD = 0.3  # 300ms window for multi-click
 RETRY_INTERVAL = 2  # Seconds between retries when mouse not found
+COOLDOWN = 0.5  # 500ms cooldown after triggering
 
 def find_mouse():
     """Find a Logitech mouse with middle button capability.
@@ -65,10 +70,38 @@ def wait_for_mouse():
             return mouse
         time.sleep(RETRY_INTERVAL)
 
+def dispatch(click_count, last_trigger_time):
+    """Dispatch action based on click count. Returns new last_trigger_time."""
+    current_time = time.time()
+    if click_count == 2:
+        logging.info("Double middle-click detected - triggering dictate")
+        try:
+            subprocess.Popen([DICTATE_SCRIPT])
+        except FileNotFoundError:
+            logging.error(f"Script not found: {DICTATE_SCRIPT}")
+        except PermissionError:
+            logging.error(f"Permission denied executing: {DICTATE_SCRIPT}")
+        except Exception as e:
+            logging.error(f"Failed to launch script: {e}")
+        return current_time
+    elif click_count >= 3:
+        logging.info("Triple middle-click detected - triggering correct")
+        try:
+            subprocess.Popen([CORRECT_SCRIPT])
+        except FileNotFoundError:
+            logging.error(f"Script not found: {CORRECT_SCRIPT}")
+        except PermissionError:
+            logging.error(f"Permission denied executing: {CORRECT_SCRIPT}")
+        except Exception as e:
+            logging.error(f"Failed to launch script: {e}")
+        return current_time
+    return last_trigger_time
+
 def run_listener(mouse):
     """Run the event listener loop. Returns when mouse disconnects or on error.
 
-    Handles grab failures and UInput creation failures gracefully.
+    Uses select() with timeout to wait for the full click window before
+    dispatching, enabling double-click vs triple-click discrimination.
     """
     ui = None
 
@@ -109,50 +142,67 @@ def run_listener(mouse):
         time.sleep(RETRY_INTERVAL)
         return
 
+    click_count = 0
     last_click_time = 0
     last_trigger_time = 0
-    COOLDOWN = 0.5  # 500ms cooldown after triggering
 
     try:
-        for event in mouse.read_loop():
-            if event.type == ecodes.EV_KEY and event.code == ecodes.BTN_MIDDLE:
-                if event.value == 1:  # Press
-                    current_time = time.time()
-
-                    # Ignore clicks during cooldown
-                    if current_time - last_trigger_time < COOLDOWN:
-                        logging.debug("Ignoring click during cooldown")
-                        continue
-
-                    time_since_last = current_time - last_click_time
-
-                    if time_since_last < DOUBLE_CLICK_THRESHOLD:
-                        # Double-click detected - trigger script
-                        logging.info("Double middle-click detected - triggering script")
-                        try:
-                            subprocess.Popen([SCRIPT])
-                        except FileNotFoundError:
-                            logging.error(f"Script not found: {SCRIPT}")
-                        except PermissionError:
-                            logging.error(f"Permission denied executing: {SCRIPT}")
-                        except Exception as e:
-                            logging.error(f"Failed to launch script: {e}")
-                        last_click_time = 0  # Reset to prevent triple-click
-                        last_trigger_time = current_time  # Start cooldown
-                    else:
-                        # First click - just record time, don't pass through
-                        last_click_time = current_time
-                        logging.debug(f"First click at {current_time}")
-                # Don't pass through middle click at all (prevents paste)
+        while True:
+            # Calculate select timeout - wait 300ms after the LAST click
+            if click_count > 0:
+                remaining = CLICK_THRESHOLD - (time.time() - last_click_time)
+                if remaining <= 0:
+                    # Window expired - dispatch based on count
+                    last_trigger_time = dispatch(click_count, last_trigger_time)
+                    click_count = 0
+                    continue
+                timeout = remaining
             else:
-                # Pass through all other events
-                try:
-                    ui.write_event(event)
-                    ui.syn()
-                except OSError:
-                    # Device disconnected during write
-                    logging.warning("Failed to write event - device may be disconnected")
-                    break
+                timeout = None  # Block indefinitely
+
+            r, _, _ = select.select([mouse.fd], [], [], timeout)
+
+            if not r:
+                # Timeout - click window expired, dispatch
+                if click_count > 0:
+                    last_trigger_time = dispatch(click_count, last_trigger_time)
+                    click_count = 0
+                continue
+
+            for event in mouse.read():
+                if event.type == ecodes.EV_KEY and event.code == ecodes.BTN_MIDDLE:
+                    if event.value == 1:  # Press
+                        current_time = time.time()
+
+                        # Ignore clicks during cooldown
+                        if current_time - last_trigger_time < COOLDOWN:
+                            logging.debug("Ignoring click during cooldown")
+                            continue
+
+                        if click_count > 0 and (current_time - last_click_time) < CLICK_THRESHOLD:
+                            # Additional click within window
+                            click_count += 1
+                            last_click_time = current_time
+                            logging.debug(f"Click #{click_count} at {current_time}")
+                            # Fire immediately on triple-click (no quad-click action)
+                            if click_count >= 3:
+                                last_trigger_time = dispatch(click_count, last_trigger_time)
+                                click_count = 0
+                        else:
+                            # Start new click sequence
+                            click_count = 1
+                            last_click_time = current_time
+                            logging.debug(f"First click at {current_time}")
+                    # Don't pass through middle click at all (prevents paste)
+                else:
+                    # Pass through all other events
+                    try:
+                        ui.write_event(event)
+                        ui.syn()
+                    except OSError:
+                        # Device disconnected during write
+                        logging.warning("Failed to write event - device may be disconnected")
+                        return
 
     except OSError as e:
         # Device disconnected
